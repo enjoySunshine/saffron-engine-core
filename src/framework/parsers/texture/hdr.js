@@ -1,5 +1,6 @@
 import { Debug } from '../../../core/debug.js';
 import { ReadStream } from '../../../core/read-stream.js';
+import { runCooperative } from '../../../core/cooperative-task.js';
 
 import {
     TEXHINT_ASSET,
@@ -17,12 +18,40 @@ import { TextureParser } from './texture.js';
  * Texture parser for hdr files.
  */
 class HdrParser extends TextureParser {
+    constructor() {
+        super();
+
+        // texture data decoded incrementally by load(), keyed on the fetched
+        // ArrayBuffer and consumed (once) by open(). Entries whose load is
+        // abandoned before open() are collected once the buffer is unreferenced.
+        this._decoded = new WeakMap();
+    }
+
     canParse(context) {
         return context.ext === 'hdr';
     }
 
     load(url, callback, asset) {
-        this.handler.fetch(url, Http.ResponseType.ARRAY_BUFFER, callback, asset);
+        this.handler.fetch(url, Http.ResponseType.ARRAY_BUFFER, (err, data) => {
+            if (err || !(data instanceof ArrayBuffer)) {
+                callback(err, data);
+                return;
+            }
+
+            // decode the pixels incrementally, yielding to the event loop between
+            // scanlines, so a single decode never occupies the main thread for the
+            // whole duration; open() then consumes the cached result synchronously.
+            // a null decode result is the same failure signal parse() returns (the
+            // reason has already been logged), not an exception that can crash the page
+            this.parseAsync(data).then((textureData) => {
+                if (textureData) {
+                    this._decoded.set(data, textureData);
+                }
+                callback(null, data);
+            }, (decodeError) => {
+                callback(decodeError);
+            });
+        }, asset);
 
         // .hdr assets should be loaded with 'rgbe' type, but historically they were not, so set a default type here
         if (asset.data && !asset.data.type) {
@@ -31,7 +60,20 @@ class HdrParser extends TextureParser {
     }
 
     open(url, data, device, textureOptions = {}) {
-        const textureData = this.parse(data);
+        let textureData;
+        if (data instanceof ArrayBuffer) {
+            textureData = this._decoded.get(data);
+            if (textureData !== undefined) {
+                // the decoded result is consumed exactly once
+                this._decoded.delete(data);
+            }
+        }
+
+        if (textureData === undefined) {
+            // synchronous fallback for data that load() did not pre-decode, such
+            // as direct callers of parse() and data supplied by bundles
+            textureData = this.parse(data);
+        }
 
         if (!textureData) {
             return null;
@@ -67,6 +109,63 @@ class HdrParser extends TextureParser {
 
     // https://floyd.lbl.gov/radiance/refer/filefmts.pdf with help from http://www.graphics.cornell.edu/~bjw/rgbe/rgbe.c
     parse(data) {
+        const header = this._readHeader(data);
+        if (!header) {
+            return null;
+        }
+
+        const { readStream, width, height, flipY } = header;
+        const pixels = this._readPixels(readStream, width, height, flipY);
+
+        if (!pixels) {
+            return null;
+        }
+
+        // create texture
+        return {
+            width: width,
+            height: height,
+            levels: [pixels]
+        };
+    }
+
+    /**
+     * Asynchronous counterpart of {@link HdrParser#parse}: decodes the same data
+     * to byte-identical pixels, but yields the thread back to the event loop
+     * between scanlines so the main thread is never occupied for the whole
+     * decode at once.
+     *
+     * @param {ArrayBuffer} data - The raw .hdr file bytes.
+     * @param {(elapsedMs: number) => void} [onChunk] - Optional observer invoked
+     * after each synchronous chunk of decode work with the time it occupied the
+     * thread. Intended for measurements, for example benchmarking the longest
+     * continuous main-thread occupancy.
+     * @returns {Promise<{width: number, height: number, levels: Uint8Array[]}|null>}
+     * The decoded texture data, or null for the same malformed inputs that make
+     * parse() return null.
+     * @ignore
+     */
+    parseAsync(data, onChunk) {
+        const header = this._readHeader(data);
+        if (!header) {
+            return Promise.resolve(null);
+        }
+
+        const { readStream, width, height, flipY } = header;
+        return this._readPixelsAsync(readStream, width, height, flipY, onChunk).then((pixels) => {
+            if (!pixels) {
+                return null;
+            }
+
+            return {
+                width: width,
+                height: height,
+                levels: [pixels]
+            };
+        });
+    }
+
+    _readHeader(data) {
         const readStream = new ReadStream(data);
 
         // require magic
@@ -106,17 +205,12 @@ class HdrParser extends TextureParser {
 
         const height = parseInt(resolution[1], 10);
         const width = parseInt(resolution[3], 10);
-        const pixels = this._readPixels(readStream, width, height, resolution[0] === '-Y');
 
-        if (!pixels) {
-            return null;
-        }
-
-        // create texture
         return {
-            width: width,
-            height: height,
-            levels: [pixels]
+            readStream,
+            width,
+            height,
+            flipY: resolution[0] === '-Y'
         };
     }
 
@@ -126,6 +220,32 @@ class HdrParser extends TextureParser {
             return this._readPixelsFlat(readStream, width, height);
         }
 
+        return this._drainGenerator(this._decodeRlePixels(readStream, width, height, flipY));
+    }
+
+    _readPixelsAsync(readStream, width, height, flipY, onChunk) {
+        // out of bounds
+        if (width < 8 || width > 0x7fff) {
+            return Promise.resolve(this._readPixelsFlat(readStream, width, height));
+        }
+
+        return runCooperative(this._decodeRlePixels(readStream, width, height, flipY), undefined, onChunk);
+    }
+
+    // Runs a decode generator to completion without ever yielding the thread.
+    _drainGenerator(generator) {
+        let result;
+        do {
+            result = generator.next();
+        } while (!result.done);
+        return result.value;
+    }
+
+    // Generator implementing pixel decoding. A yield marks the end of a
+    // scanline, so the async driver can return to the event loop between
+    // scanlines while the sync driver simply ignores the yields. Both parse()
+    // and parseAsync() run this exact code, so their output cannot diverge.
+    *_decodeRlePixels(readStream, width, height, flipY) {
         const rgbe = [0, 0, 0, 0];
 
         // check first scanline width to determine whether the file is RLE
@@ -184,6 +304,7 @@ class HdrParser extends TextureParser {
             }
 
             scanstart += width * 4 * (flipY ? 1 : -1);
+            yield;
         }
 
         return view;
