@@ -1,0 +1,113 @@
+// backend shader implementation code which executes after the front end code.
+export default /* glsl */`
+
+#ifdef LIT_NEEDS_NORMAL
+    #include "cubeMapRotatePS"
+    #include "cubeMapProjectPS"
+    #include "envProcPS"
+#endif
+
+// ----- specular or reflections (also needed by refraction, which uses specularity) -----
+#if defined(LIT_SPECULAR_OR_REFLECTION) || defined(LIT_REFRACTION)
+    #ifdef LIT_METALNESS
+        #include "metalnessModulatePS"
+    #endif
+
+    #ifdef LIT_IRIDESCENCE
+        #include "iridescenceDiffractionPS"
+    #endif
+#endif
+
+// fresnel is also needed by refraction
+#if defined(LIT_SPECULAR_OR_REFLECTION) || defined(LIT_REFRACTION)
+    #if LIT_FRESNEL_MODEL == SCHLICK
+        #include "fresnelSchlickPS"
+    #endif
+#endif
+
+// ----- ambient occlusion -----
+#ifdef LIT_AO
+    #include "aoDiffuseOccPS"
+    #include "aoSpecOccPS"
+#endif
+
+#if LIT_REFLECTION_SOURCE == ENVATLASHQ
+    #include "envAtlasPS"
+    #include "reflectionEnvHQPS"
+#elif LIT_REFLECTION_SOURCE == ENVATLAS
+    #include "envAtlasPS"
+    #include "reflectionEnvPS"
+#elif LIT_REFLECTION_SOURCE == CUBEMAP
+    #include "reflectionCubePS"
+#elif LIT_REFLECTION_SOURCE == SPHEREMAP
+    #include "reflectionSpherePS"
+#elif LIT_REFLECTION_SOURCE == PLANAR
+    #include "reflectionPlanarPS"
+#endif
+
+#ifdef LIT_REFLECTIONS
+    #ifdef LIT_CLEARCOAT
+        #include "reflectionCCPS"
+    #endif
+
+    #ifdef LIT_SHEEN
+        #include "reflectionSheenPS"
+    #endif
+#endif
+
+#ifdef LIT_REFRACTION
+    #if defined(LIT_DYNAMIC_REFRACTION)
+        #include "refractionDynamicPS"
+    #elif LIT_REFLECTION_SOURCE != NONE
+        // cube refraction only needs a reflection source, not the specular reflection path
+        #include "refractionCubePS"
+    #endif
+#endif
+
+#ifdef LIT_SHEEN
+    #include "lightSheenPS"
+#endif
+
+#ifdef LIT_SPECULAR
+    #ifdef LIT_LIGHTING
+        #ifdef LIT_GGX_SPECULAR
+            #ifdef LIT_ANISOTROPY
+                #include "lightSpecularAnisoGGXPS"
+            #else
+                #include "lightSpecularGGXPS"
+            #endif
+        #else
+            #include "lightSpecularBlinnPS"
+        #endif
+    #endif
+#endif
+
+#include "combinePS"
+
+#ifdef LIT_LIGHTMAP
+    #include "lightmapAddPS"
+#endif
+
+#ifdef LIT_ADD_AMBIENT
+    #include "ambientPS"
+#endif
+
+#ifdef LIT_MSDF
+    #include "msdfPS"
+#endif
+
+#ifdef LIT_NEEDS_NORMAL
+    #include "viewDirPS"
+    #ifdef LIT_SPECULAR
+        #ifdef LIT_ANISOTROPY
+            #include "reflDirAnisoPS"
+        #else
+            #include "reflDirPS"
+        #endif
+    #endif
+#endif
+
+// lighting functionality
+#include "lightingPS"
+
+`;

@@ -1,0 +1,61 @@
+export default /* wgsl */`
+
+#if STD_OPACITY_DITHER == BAYER2 || STD_OPACITY_DITHER == BAYER4 || STD_OPACITY_DITHER == BAYER8 || STD_OPACITY_DITHER == BAYER16
+    #include "bayerPS"
+#endif
+
+uniform blueNoiseJitter: vec4f;
+
+#if STD_OPACITY_DITHER == BLUENOISE
+    var blueNoiseTex32 : texture_2d<f32>;
+    var blueNoiseTex32Sampler : sampler;
+#endif
+
+fn opacityDither(alpha: f32, id: f32) {
+    if (alpha <= 0.0) {
+        discard;
+    }
+
+    if (alpha >= 1.0) {
+        return;
+    }
+
+    #if STD_OPACITY_DITHER == BAYER8
+
+        var noise: f32 = bayer8(floor((pcPosition.xy + uniform.blueNoiseJitter.xy + vec2f(id, id * 1.6180339)) % vec2f(8.0))) / 64.0;
+
+    #else
+
+        #if STD_OPACITY_DITHER == BAYER2
+            var noise: f32 = bayer2(floor((pcPosition.xy + uniform.blueNoiseJitter.xy + vec2f(id, id * 1.6180339)) % vec2f(2.0))) / 4.0;
+        #endif
+
+        #if STD_OPACITY_DITHER == BAYER4
+            var noise: f32 = bayer4(floor((pcPosition.xy + uniform.blueNoiseJitter.xy + vec2f(id, id * 1.6180339)) % vec2f(4.0))) / 16.0;
+        #endif
+
+        #if STD_OPACITY_DITHER == BAYER16
+            var noise: f32 = bayer16(floor((pcPosition.xy + uniform.blueNoiseJitter.xy + vec2f(id, id * 1.6180339)) % vec2f(16.0))) / 256.0;
+        #endif
+
+        #if STD_OPACITY_DITHER == BLUENOISE
+            var uv = fract(pcPosition.xy / 32.0 + uniform.blueNoiseJitter.xy + vec2f(id, id * 1.6180339));
+            var noise: f32 = textureSampleLevel(blueNoiseTex32, blueNoiseTex32Sampler, uv, 0.0).y;
+        #endif
+
+        #if STD_OPACITY_DITHER == IGNNOISE
+            // based on https://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare/
+            var magic = vec3f(0.06711056, 0.00583715, 52.9829189);
+            var noise: f32 = fract(magic.z * fract(dot(pcPosition.xy + uniform.blueNoiseJitter.xy + vec2f(id, id * 1.6180339), magic.xy)));
+        #endif
+
+    #endif
+
+    // convert the noise to linear space, as that is specified in sRGB space (stores perceptual values)
+    noise = pow(noise, 2.2);
+
+    if (alpha < noise) {
+        discard;
+    }
+}
+`;

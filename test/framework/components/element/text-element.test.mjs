@@ -1,0 +1,2477 @@
+import { expect } from 'chai';
+import { restore } from 'sinon';
+
+import { Color } from '../../../../src/core/math/color.js';
+import { Vec2 } from '../../../../src/core/math/vec2.js';
+import { Vec3 } from '../../../../src/core/math/vec3.js';
+import { BoundingBox } from '../../../../src/core/shape/bounding-box.js';
+import { Asset } from '../../../../src/framework/asset/asset.js';
+import { Entity } from '../../../../src/framework/entity.js';
+import { CanvasFont } from '../../../../src/framework/font/canvas-font.js';
+import { Font } from '../../../../src/framework/font/font.js';
+import { createApp } from '../../../app.mjs';
+import { jsdomSetup, jsdomTeardown } from '../../../jsdom.mjs';
+
+describe('TextElement', function () {
+    let app;
+    let assets;
+    let entity;
+    let element;
+    let fontAsset;
+
+    beforeEach(function (done) {
+        jsdomSetup();
+        app = createApp();
+
+        buildElement(done);
+    });
+
+    afterEach(function () {
+        for (const key in assets) {
+            assets[key].unload();
+        }
+
+        fontAsset = null;
+        app?.destroy();
+        app = null;
+        jsdomTeardown();
+        app = null;
+        restore();
+    });
+
+    function buildElement(callback) {
+        entity = new Entity('myEntity');
+        element = app.systems.element.addComponent(entity, { type: 'text' });
+        element.autoWidth = false;
+        element.wrapLines = true;
+        element.width = 200;
+
+        fontAsset = new Asset('roboto-regular.json', 'font', {
+            url: '/test/assets/fonts/roboto-regular.json'
+        });
+
+        fontAsset.ready(function () {
+            // use timeout to prevent tests running inside ready() callback
+            setTimeout(function () {
+                callback();
+            });
+        });
+
+        app.assets.add(fontAsset);
+        app.assets.load(fontAsset);
+
+        app.root.addChild(entity);
+
+        assets = {
+            font: fontAsset
+        };
+    }
+
+    function assertLineContents(expectedLineContents) {
+        expect(element.lines.length).to.equal(expectedLineContents.length);
+        expect(element.lines).to.deep.equal(expectedLineContents);
+    }
+
+    // x position of the left edge of every glyph quad, in the order the glyphs were laid out
+    function quadLefts() {
+        const meshInfo = element._text._meshInfo[0];
+        const lefts = [];
+        for (let quad = 0; quad < meshInfo.quad; quad++) {
+            lefts.push(meshInfo.positions[quad * 4 * 3]);
+        }
+        return lefts;
+    }
+
+    // range of glyph quads produced by each line - every symbol on a line produces one quad
+    function lineQuadRanges() {
+        const ranges = [];
+        let start = 0;
+        for (const line of element.lines) {
+            const chars = Array.from(line);
+            ranges.push({ start: start, end: start + chars.length - 1, chars: chars });
+            start += chars.length;
+        }
+        return ranges;
+    }
+
+    // leftmost and rightmost glyph edge of each line
+    function lineInkExtents() {
+        const meshInfo = element._text._meshInfo[0];
+        const extents = [];
+        let quad = 0;
+        for (const line of element.lines) {
+            let left = Infinity;
+            let right = -Infinity;
+            for (const char of Array.from(line)) {
+                if (!/\s/.test(char)) {
+                    const base = quad * 4 * 3;
+                    left = Math.min(left, meshInfo.positions[base], meshInfo.positions[base + 3]);
+                    right = Math.max(right, meshInfo.positions[base], meshInfo.positions[base + 3]);
+                }
+                quad++;
+            }
+            extents.push({ left: left, right: right });
+        }
+        return extents;
+    }
+
+    // A justified line reaches both of the edges that the two extremes of alignment push it to,
+    // at the same time. Which extreme hugs which edge depends on the text direction, so compare
+    // against whichever of the two reaches furthest in each direction.
+    function assertJustifiedLinesAreFlushWithBothEdges() {
+        element.justify = false;
+
+        element.alignment = new Vec2(0, 0.5);
+        const alignedToZero = lineInkExtents();
+
+        element.alignment = new Vec2(1, 0.5);
+        const alignedToOne = lineInkExtents();
+
+        element.justify = true;
+        const justified = lineInkExtents();
+        const lineGaps = element._text._lineGaps;
+
+        let stretchedLines = 0;
+        justified.forEach((extent, i) => {
+            if (lineGaps[i] > 0) {
+                expect(extent.left).to.be.closeTo(Math.min(alignedToZero[i].left, alignedToOne[i].left), 0.001);
+                expect(extent.right).to.be.closeTo(Math.max(alignedToZero[i].right, alignedToOne[i].right), 0.001);
+                stretchedLines++;
+            }
+        });
+
+        expect(stretchedLines).to.be.above(0);
+    }
+
+    function assertLineColors(expectedLineColors) {
+        expect(element._text.symbolColors.length).to.equal(expectedLineColors.length);
+        expect(element._text.symbolColors).to.deep.equal(expectedLineColors);
+    }
+
+    function assertLineOutlineParams(expectedLineOutlineParams) {
+        expect(element._text.symbolOutlineParams.length).to.equal(expectedLineOutlineParams.length);
+        expect(element._text.symbolOutlineParams).to.deep.equal(expectedLineOutlineParams);
+    }
+
+    function assertLineShadowParams(expectedLineShadowParams) {
+        expect(element._text.symbolShadowParams.length).to.equal(expectedLineShadowParams.length);
+        expect(element._text.symbolShadowParams).to.deep.equal(expectedLineShadowParams);
+    }
+
+    // Creates data for a single translation as if it was a whole asset
+    function createTranslation(locale, key, translations) {
+        const messages = {};
+        messages[key] = translations;
+        const data = {
+            header: {
+                version: 1
+            },
+            data: [{
+                info: {
+                    locale: locale
+                },
+                messages: messages
+            }]
+        };
+
+        return data;
+    }
+
+    // Adds the specified key->translations pair for the specified locale to
+    // the specified i18n instance, as if it's adding a whole new asset
+    function addText(locale, key, translations) {
+        const data = createTranslation(locale, key, translations);
+        app.i18n.addData(data);
+        return data;
+    }
+
+    function registerRtlHandler(lineBreakChar) {
+        app.systems.element.registerRtlReorder(function (symbols) {
+            const mapping = symbols.map(function (s, i) {
+                return i;
+            });
+            return {
+                mapping: mapping,
+                rtl: true
+            };
+        });
+    }
+
+    it('does not break onto multiple lines if the text is short enough', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcde fghij';
+        assertLineContents(['abcde fghij']);
+    });
+
+    it('keeps the position of an entity that is already under a screen', function () {
+        const screen = new Entity('screen');
+        screen.addComponent('screen', { screenSpace: true });
+        app.root.addChild(screen);
+
+        const label = new Entity('label');
+        screen.addChild(label);
+        label.setLocalPosition(0, -40, 0);
+
+        // the text sizes the element to fit it, so no width or height is given
+        label.addComponent('element', {
+            type: 'text',
+            fontAsset: fontAsset,
+            text: 'abcde',
+            anchor: [0.5, 1, 0.5, 1],
+            pivot: [0.5, 1]
+        });
+
+        const position = label.getLocalPosition();
+        expect(position.x).to.be.closeTo(0, 1e-4);
+        expect(position.y).to.be.closeTo(-40, 1e-4);
+    });
+
+
+    it('does not break onto multiple lines if the autoWidth is set to true', function () {
+        element.fontAsset = fontAsset;
+
+        element.autoWidth = true;
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        assertLineContents(['abcde fghij klmno pqrst uvwxyz']);
+    });
+
+    it('updates line wrapping once autoWidth becomes false and a width is set', function () {
+        element.fontAsset = fontAsset;
+
+        element.autoWidth = true;
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        expect(element.lines.length).to.equal(1);
+        element.autoWidth = false;
+        element.width = 200;
+        expect(element.lines.length).to.equal(3);
+    });
+
+    it('does not break onto multiple lines if the wrapLines is set to false', function () {
+        element.fontAsset = fontAsset;
+
+        element.wrapLines = false;
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        assertLineContents(['abcde fghij klmno pqrst uvwxyz']);
+    });
+
+    it('updates line wrapping once wrapLines becomes true', function () {
+        element.fontAsset = fontAsset;
+
+        element.wrapLines = false;
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        expect(element.lines.length).to.equal(1);
+        element.wrapLines = true;
+        expect(element.lines.length).to.equal(3);
+    });
+
+    it('does not justify text by default', function () {
+        element.fontAsset = fontAsset;
+
+        expect(element.justify).to.equal(false);
+
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        const before = quadLefts();
+        element.justify = true;
+        expect(quadLefts()).to.not.deep.equal(before);
+    });
+
+    it('does not justify text when wrapLines is false', function () {
+        element.fontAsset = fontAsset;
+
+        element.wrapLines = false;
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        const before = quadLefts();
+
+        element.justify = true;
+        expect(quadLefts()).to.deep.equal(before);
+    });
+
+    it('does not change where lines break when justifying', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        const before = element.lines.slice();
+
+        element.justify = true;
+        expect(element.lines).to.deep.equal(before);
+    });
+
+    it('justifies a wrapped line flush with both edges of the element', function () {
+        element.fontAsset = fontAsset;
+        element.alignment = new Vec2(0, 0.5);
+
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        assertLineContents([
+            'abcde fghij ',
+            'klmno pqrst ',
+            'uvwxyz'
+        ]);
+
+        const before = quadLefts();
+        const slack = element.calculatedWidth - element._text._lineWidths[0];
+        expect(slack).to.be.above(0);
+
+        element.justify = true;
+        const after = quadLefts();
+
+        // the first line has a single gap, so 'abcde' and the space after it stay where they are
+        // and 'fghij' takes up all of the space the line had left over
+        for (let quad = 0; quad <= 5; quad++) {
+            expect(after[quad]).to.be.closeTo(before[quad], 0.001);
+        }
+        for (let quad = 6; quad <= 11; quad++) {
+            expect(after[quad]).to.be.closeTo(before[quad] + slack, 0.001);
+        }
+    });
+
+    it('does not justify the last line of the text', function () {
+        element.fontAsset = fontAsset;
+        element.alignment = new Vec2(0, 0.5);
+
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        const ranges = lineQuadRanges();
+        const lastLine = ranges[ranges.length - 1];
+
+        const before = quadLefts();
+        element.justify = true;
+        const after = quadLefts();
+
+        for (let quad = lastLine.start; quad <= lastLine.end; quad++) {
+            expect(after[quad]).to.be.closeTo(before[quad], 0.001);
+        }
+    });
+
+    it('does not justify a line ended by an explicit line break', function () {
+        element.fontAsset = fontAsset;
+        element.alignment = new Vec2(0, 0.5);
+
+        // short enough that neither line wraps, so both lines are unjustifiable - the first
+        // because it ends in a line break and the second because it is the last line
+        element.text = 'ab cd\nef gh';
+        assertLineContents(['ab cd', 'ef gh']);
+
+        const before = quadLefts();
+        element.justify = true;
+        expect(quadLefts()).to.deep.equal(before);
+    });
+
+    it('does not justify a line that has no gaps to widen', function () {
+        element.fontAsset = fontAsset;
+        element.alignment = new Vec2(0, 0.5);
+
+        // a single word broken across lines has no whitespace to stretch
+        element.text = 'abcdefghijklmnopqrstuvwxyz';
+        expect(element.lines.length).to.be.above(1);
+
+        const before = quadLefts();
+        element.justify = true;
+        expect(quadLefts()).to.deep.equal(before);
+    });
+
+    it('widens every gap on a justified line by the same amount', function () {
+        element.fontAsset = fontAsset;
+        element.alignment = new Vec2(0, 0.5);
+        element.width = 300;
+
+        element.text = 'aa bb cc dd ee ff gg hh ii jj kk ll';
+
+        const ranges = lineQuadRanges();
+        const before = quadLefts();
+
+        element.justify = true;
+        const after = quadLefts();
+
+        // gap counts are only tracked while justifying, so they have to be read afterwards
+        const lineGaps = element._text._lineGaps.slice();
+
+        // pick a stretched line with more than one gap in it
+        const lineIndex = lineGaps.findIndex((gaps, i) => gaps > 1 && i < ranges.length - 1);
+        expect(lineIndex).to.be.at.least(0);
+
+        const range = ranges[lineIndex];
+        const slack = element.calculatedWidth - element._text._lineWidths[lineIndex];
+        expect(slack).to.be.above(0);
+
+        // how far the first glyph of each word on the line moved
+        const shifts = [];
+        for (let quad = range.start; quad <= range.end; quad++) {
+            const char = range.chars[quad - range.start];
+            const prevChar = range.chars[quad - range.start - 1];
+            if (!/\s/.test(char) && (quad === range.start || /\s/.test(prevChar))) {
+                shifts.push(after[quad] - before[quad]);
+            }
+        }
+
+        expect(shifts.length).to.equal(lineGaps[lineIndex] + 1);
+
+        // the first word does not move, the last one takes up all of the slack, and the words in
+        // between are spaced evenly, so each word moves one step further than the one before it
+        const step = slack / lineGaps[lineIndex];
+        shifts.forEach((shift, i) => {
+            expect(shift).to.be.closeTo(i * step, 0.001);
+        });
+    });
+
+    it('justifies wrapped lines flush with both edges of the element', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        assertJustifiedLinesAreFlushWithBothEdges();
+    });
+
+    it('rtl - justifies wrapped lines flush with both edges of the element', function () {
+        registerRtlHandler();
+
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+
+        // guard against the reorder handler silently failing to turn rtl on, which would leave
+        // this exercising the ltr path and let the rtl behavior regress unnoticed
+        expect(element._text._rtl).to.equal(true);
+
+        assertJustifiedLinesAreFlushWithBothEdges();
+    });
+
+    it('initializes justify from component data', function () {
+        const other = new Entity();
+        const otherElement = app.systems.element.addComponent(other, {
+            type: 'text',
+            justify: true
+        });
+
+        expect(otherElement.justify).to.equal(true);
+    });
+
+    it('cloning text element clones the justify setting', function () {
+        element.fontAsset = fontAsset;
+        element.justify = true;
+
+        const clone = entity.clone();
+        expect(clone.element.justify).to.equal(true);
+    });
+
+    it('breaks onto multiple lines if individual lines are too long', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        assertLineContents([
+            'abcde fghij ',
+            'klmno pqrst ',
+            'uvwxyz'
+        ]);
+    });
+
+    it('breaks individual words if they are too long to fit onto a line by themselves (single word case)', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcdefghijklmnopqrstuvwxyz';
+        assertLineContents([
+            'abcdefghijkl',
+            'mnopqrstuvw',
+            'xyz'
+        ]);
+    });
+
+    it('breaks individual words if they are too long to fit onto a line by themselves (multi word case)', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcdefgh ijklmnopqrstuvwxyz';
+        assertLineContents([
+            'abcdefgh ',
+            'ijklmnopqrstu',
+            'vwxyz'
+        ]);
+    });
+
+    it('breaks individual characters onto separate lines if the width is really constrained', function () {
+        element.fontAsset = fontAsset;
+
+        element.width = 1;
+        element.text = 'abcdef ghijkl';
+        assertLineContents([
+            'a',
+            'b',
+            'c',
+            'd',
+            'e',
+            'f ',
+            'g',
+            'h',
+            'i',
+            'j',
+            'k',
+            'l'
+        ]);
+    });
+
+    it('does not include whitespace at the end of a line in width calculations', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcdefgh        i';
+        assertLineContents([
+            'abcdefgh        ',
+            'i'
+        ]);
+    });
+
+    it('breaks words on hyphens', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcde fghij-klm nopqr stuvwxyz';
+        assertLineContents([
+            'abcde fghij-',
+            'klm nopqr ',
+            'stuvwxyz'
+        ]);
+    });
+
+    it('keeps hyphenated word segments together when wrapping them', function () {
+        element.fontAsset = fontAsset;
+
+        element.width = 150;
+        element.text = 'abcde fghij-klm nopqr stuvwxyz';
+        assertLineContents([
+            'abcde ',
+            'fghij-klm ',
+            'nopqr ',
+            'stuvwxyz'
+        ]);
+    });
+
+    it('splits lines on \\n', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcde\nfghij';
+        assertLineContents([
+            'abcde',
+            'fghij'
+        ]);
+    });
+
+    it('splits lines on \\r', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcde\rfghij';
+        assertLineContents([
+            'abcde',
+            'fghij'
+        ]);
+    });
+
+    it('splits lines on multiple \\n', function () {
+        element.fontAsset = fontAsset;
+
+        element.text = 'abcde\n\n\nfg\nhij';
+        assertLineContents([
+            'abcde',
+            '',
+            '',
+            'fg',
+            'hij'
+        ]);
+    });
+
+    it('does not break beyond 1 line if maxLines is equal to 1', function () {
+        element.fontAsset = fontAsset;
+        element.maxLines = 1;
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        // long contents
+        assertLineContents([
+            'abcde fghij klmno pqrst uvwxyz'
+        ]);
+        // multiple new lines
+        element.text = 'abcde\n\n\nfg\nhij';
+        assertLineContents([
+            'abcdefghij'
+        ]);
+        // \r chars
+        element.text = 'abcde\rfghij';
+        assertLineContents([
+            'abcdefghij'
+        ]);
+        // hyphens
+        element.text = 'abcde fghij-klm nopqr stuvwxyz';
+        assertLineContents([
+            'abcde fghij-klm nopqr stuvwxyz'
+        ]);
+        // whitespace at end of line
+        element.text = 'abcdefgh        i';
+        assertLineContents([
+            'abcdefgh        i'
+        ]);
+        // individual characters
+        element.width = 1;
+        element.text = 'abcdef ghijkl';
+        assertLineContents([
+            'abcdef ghijkl'
+        ]);
+    });
+
+    it('breaks remaining text in last line when maxLines limit is reached', function () {
+        element.fontAsset = fontAsset;
+        element.maxLines = 2;
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        // long contents
+        assertLineContents([
+            'abcde fghij ',
+            'klmno pqrst uvwxyz'
+        ]);
+        // multiple new lines
+        element.text = 'abcde\n\n\nfg\nhij';
+        assertLineContents([
+            'abcde',
+            'fghij'
+        ]);
+        // \r chars
+        element.text = 'abcde\rfghij';
+        assertLineContents([
+            'abcde',
+            'fghij'
+        ]);
+        // hyphens
+        element.text = 'abcde fghij-klm nopqr stuvwxyz';
+        assertLineContents([
+            'abcde fghij-',
+            'klm nopqr stuvwxyz'
+        ]);
+        // whitespace at end of line
+        element.text = 'abcdefgh        i';
+        assertLineContents([
+            'abcdefgh        ',
+            'i'
+        ]);
+        // individual characters
+        element.width = 1;
+        element.text = 'abcdef ghijkl';
+        assertLineContents([
+            'a',
+            'bcdef ghijkl'
+        ]);
+    });
+
+    it('rtl - reorder handler turns on rtl layout', function () {
+        registerRtlHandler();
+
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcde fghij';
+
+        // without this the rtl tests below all run through the ltr path, and the rtl specific
+        // layout code they are meant to cover is never reached
+        expect(element._text._rtl).to.equal(true);
+    });
+
+    it('rtl - breaks onto multiple lines if individual lines are too long', function () {
+        registerRtlHandler();
+
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        assertLineContents([
+            'abcde fghij ',
+            'klmno pqrst ',
+            'uvwxyz'
+        ]);
+    });
+
+    it('rtl - breaks individual words if they are too long to fit onto a line by themselves (single word case)', function () {
+        registerRtlHandler();
+
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcdefghijklmnopqrstuvwxyz';
+        assertLineContents([
+            'abcdefghijkl',
+            'mnopqrstuvw',
+            'xyz'
+        ]);
+    });
+
+    it('rtl - breaks individual words if they are too long to fit onto a line by themselves (multi word case)', function () {
+        registerRtlHandler();
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcdefgh ijklmnopqrstuvwxyz';
+        assertLineContents([
+            'abcdefgh ',
+            'ijklmnopqrstu',
+            'vwxyz'
+        ]);
+    });
+
+    it('rtl - breaks individual characters onto separate lines if the width is really constrained', function () {
+        registerRtlHandler();
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.width = 1;
+        element.text = 'abcdef ghijkl';
+        assertLineContents([
+            'a',
+            'b',
+            'c',
+            'd',
+            'e',
+            'f ',
+            'g',
+            'h',
+            'i',
+            'j',
+            'k',
+            'l'
+        ]);
+    });
+
+    it('rtl - does not include whitespace at the end of a line in width calculations', function () {
+        registerRtlHandler();
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcdefgh        i';
+        assertLineContents([
+            'abcdefgh        ',
+            'i'
+        ]);
+    });
+
+    it('rtl - breaks words on hyphens', function () {
+        registerRtlHandler();
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcde fghij-klm nopqr stuvwxyz';
+        assertLineContents([
+            'abcde fghij-',
+            'klm nopqr ',
+            'stuvwxyz'
+        ]);
+    });
+
+    it('rtl - keeps hyphenated word segments together when wrapping them', function () {
+        registerRtlHandler();
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.width = 150;
+        element.text = 'abcde fghij-klm nopqr stuvwxyz';
+        assertLineContents([
+            'abcde ',
+            'fghij-klm ',
+            'nopqr ',
+            'stuvwxyz'
+        ]);
+    });
+
+    it('rtl - splits lines on \\n', function () {
+        registerRtlHandler();
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcde\nfghij';
+        assertLineContents([
+            'abcde',
+            'fghij'
+        ]);
+    });
+
+    it('rtl - splits lines on \\r', function () {
+        registerRtlHandler('\r');
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcde\rfghij';
+        assertLineContents([
+            'abcde',
+            'fghij'
+        ]);
+    });
+
+    it('rtl - splits lines on multiple \\n', function () {
+        registerRtlHandler();
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+
+        element.text = 'abcde\n\n\nfg\nhij';
+        assertLineContents([
+            'abcde',
+            '',
+            '',
+            'fg',
+            'hij'
+        ]);
+    });
+
+    it('rtl - does not break beyond 1 line if maxLines is equal to 1', function () {
+        registerRtlHandler();
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+        element.maxLines = 1;
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        // long contents
+        assertLineContents([
+            'abcde fghij klmno pqrst uvwxyz'
+        ]);
+        // multiple new lines
+        element.text = 'abcde\n\n\nfg\nhij';
+        assertLineContents([
+            'abcdefghij'
+        ]);
+        // \r chars
+        registerRtlHandler('\r');
+        element.text = 'abcde\rfghij';
+        assertLineContents([
+            'abcdefghij'
+        ]);
+
+        registerRtlHandler('\n');
+        // hyphens
+        element.text = 'abcde fghij-klm nopqr stuvwxyz';
+        assertLineContents([
+            'abcde fghij-klm nopqr stuvwxyz'
+        ]);
+        // whitespace at end of line
+        element.text = 'abcdefgh        i';
+        assertLineContents([
+            'abcdefgh        i'
+        ]);
+        // individual characters
+        element.width = 1;
+        element.text = 'abcdef ghijkl';
+        assertLineContents([
+            'abcdef ghijkl'
+        ]);
+    });
+
+    it('rtl breaks remaining text in last line when maxLines limit is reached', function () {
+        registerRtlHandler();
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+        element.maxLines = 2;
+        element.text = 'abcde fghij klmno pqrst uvwxyz';
+        // long contents
+        assertLineContents([
+            'abcde fghij ',
+            'klmno pqrst uvwxyz'
+        ]);
+        // multiple new lines
+        element.text = 'abcde\n\n\nfg\nhij';
+        assertLineContents([
+            'abcde',
+            'fghij'
+        ]);
+        // \r chars
+        registerRtlHandler('\r');
+        element.text = 'abcde\rfghij';
+        assertLineContents([
+            'abcde',
+            'fghij'
+        ]);
+        // hyphens
+        registerRtlHandler('\n');
+        element.text = 'abcde fghij-klm nopqr stuvwxyz';
+        assertLineContents([
+            'abcde fghij-',
+            'klm nopqr stuvwxyz'
+        ]);
+        // whitespace at end of line
+        element.text = 'abcdefgh        i';
+        assertLineContents([
+            'abcdefgh        ',
+            'i'
+        ]);
+        // individual characters
+        element.width = 1;
+        element.text = 'abcdef ghijkl';
+        assertLineContents([
+            'a',
+            'bcdef ghijkl'
+        ]);
+    });
+
+    it('rtl and ltr text end up with the same width', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = true;
+        element.wrapLines = false;
+
+        const ltrWidths = {
+            oneLine: 0,
+            spaces: 0,
+            newLines: 0
+        };
+
+        const rtlWidths = Object.assign({}, ltrWidths);
+
+        // new lines
+        element.text = 'abcdefghij';
+        ltrWidths.oneLine = element.width;
+
+        element.text = 'abcde\nfghij';
+        ltrWidths.newLines = element.width;
+
+        element.text = '   abcdefghij   ';
+        ltrWidths.spaces = element.width;
+
+        element.text = '';
+
+        registerRtlHandler();
+        element.rtlReorder = true;
+
+        element.text = 'abcdefghij';
+        rtlWidths.oneLine = element.width;
+
+        element.text = 'abcde\nfghij';
+        rtlWidths.newLines = element.width;
+
+        element.text = '   abcdefghij   ';
+        rtlWidths.spaces = element.width;
+
+        for (const key in ltrWidths) {
+            expect(ltrWidths[key]).to.equal(rtlWidths[key]);
+        }
+    });
+
+    it('rtl and ltr text in one line using CanvasFont ends up with the same width', function () {
+        const cf = new CanvasFont(app, {
+            fontName: 'Arial',
+            fontSize: 64,
+            width: 1024,
+            height: 1024
+        });
+
+        cf.createTextures('abcdefghij');
+
+        element.font = cf;
+        element.autoWidth = true;
+        element.wrapLines = false;
+
+        const ltrWidths = {
+            oneLine: 0,
+            spaces: 0,
+            newLines: 0
+        };
+
+        const rtlWidths = Object.assign({}, ltrWidths);
+
+        // new lines
+        element.text = 'abcdefghij';
+        ltrWidths.oneLine = element.width;
+
+        element.text = 'abcde\nfghij';
+        ltrWidths.newLines = element.width;
+
+        element.text = '   abcdefghij   ';
+        ltrWidths.spaces = element.width;
+
+        element.text = '';
+
+        registerRtlHandler();
+        element.rtlReorder = true;
+
+        element.text = 'abcdefghij';
+        rtlWidths.oneLine = element.width;
+
+        element.text = 'abcde\nfghij';
+        rtlWidths.newLines = element.width;
+
+        element.text = '   abcdefghij   ';
+        rtlWidths.spaces = element.width;
+
+        for (const key in ltrWidths) {
+            expect(ltrWidths[key]).to.equal(rtlWidths[key]);
+        }
+    });
+
+    it('reduces font size when width is larger then the element width and autoFitWidth is true', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.width = 10;
+        element.text = 'ab';
+
+        const width = element.calculatedWidth;
+        const textWidth = element._text.width;
+        element.autoFitWidth = true;
+        expect(element.fontSize).to.equal(Math.floor(32 * width / textWidth));
+        expect(element._text._scaledLineHeight).to.equal(32 * element.fontSize / element.maxFontSize);
+    });
+
+    it('does not reduce font size when width is larger then the element width and autoFitWidth is false', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.fontSize = 20;
+        element.lineHeight = 20;
+        element.width = 10;
+        element.text = 'ab';
+        expect(element.fontSize).to.equal(20);
+        expect(element._text._scaledLineHeight).to.equal(20);
+    });
+
+    it('does not reduce font size when autoFitWidth and autoWidth are both true', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = true;
+        element.autoHeight = false;
+        element.width = 10;
+        element.text = 'ab';
+        expect(element.fontSize).to.equal(32);
+    });
+
+    it('does not reduce the font size below minFontSize', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.width = 1;
+        element.text = 'ab';
+        element.autoFitWidth = true;
+        expect(element.fontSize).to.equal(element.minFontSize);
+    });
+
+    it('updates fontSize to new minFontSize', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.width = 1;
+        element.text = 'abcdefghijklmn';
+        element.minFontSize = 8;
+        element.autoFitWidth = true;
+        expect(element.fontSize).to.equal(8);
+        element.minFontSize = 4;
+        expect(element.fontSize).to.equal(4);
+    });
+
+    it('does not increase the font size above maxFontSize', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.maxFontSize = 10;
+        element.width = 1000;
+        element.text = 'ab';
+        element.autoFitWidth = true;
+        expect(element.fontSize).to.equal(element.maxFontSize);
+    });
+
+    it('updates fontSize to new maxFontSize', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.maxFontSize = 10;
+        element.width = 1000;
+        element.text = 'abcdefghijklmn';
+        element.autoFitWidth = true;
+        expect(element.fontSize).to.equal(10);
+        element.maxFontSize = 11;
+        expect(element.fontSize).to.equal(11);
+    });
+
+    it('reduces font size when height is larger then the element height and autoFitHeight is true', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.height = 50;
+        element.text = 'ab\nab';
+        element.autoFitHeight = true;
+        expect(element.fontSize).to.equal(24);
+        expect(element._text._scaledLineHeight).to.equal(24);
+    });
+
+    it('does not reduce font size when height is larger then the element height and autoFitHeight is false', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.fontSize = 20;
+        element.lineHeight = 20;
+        element.height = 50;
+        element.text = 'ab\nab';
+        expect(element.fontSize).to.equal(20);
+        expect(element._text._scaledLineHeight).to.equal(20);
+    });
+
+    it('does not reduce font size when autoFitHeight and autoHeight are both true', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = true;
+        element.autoFitHeight = true;
+        element.height = 50;
+        element.text = 'ab\nab';
+        expect(element.fontSize).to.equal(32);
+    });
+
+    it('does not reduce font size below minFontSize when height is larger then the element height', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.height = 1;
+        element.minFontSize = 8;
+        element.text = 'ab\nab';
+        element.autoFitHeight = true;
+        expect(element.fontSize).to.equal(element.minFontSize);
+    });
+
+    it('does not increase font size above maxFontSize when height is smaller then the element height', function () {
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.height = 1000;
+        element.maxFontSize = 8;
+        element.text = 'ab\nab';
+        element.autoFitHeight = true;
+        expect(element.fontSize).to.equal(element.maxFontSize);
+    });
+
+    it('restores fontSize after setting autoFitWidth to false', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.width = 10;
+        element.text = 'ab';
+        element.autoFitWidth = true;
+        expect(element.fontSize).to.not.equal(44);
+        element.autoFitWidth = false;
+        expect(element.fontSize).to.equal(44);
+    });
+
+    it('does not change fontSize after setting autoFitWidth to true while autoWidth is already true', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = true;
+        element.autoHeight = false;
+        element.text = 'ab';
+        expect(element.fontSize).to.equal(44);
+        element.autoFitWidth = true;
+        expect(element.fontSize).to.equal(44);
+    });
+
+    it('restores fontSize to maxFontSize after setting autoFitWidth to false if autoFitHeight is true', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.width = 10;
+        element.height = 1000;
+        element.text = 'ab';
+        element.autoFitWidth = true;
+        element.autoFitHeight = true;
+        expect(element.fontSize).to.not.equal(44);
+        element.autoFitWidth = false;
+        expect(element.fontSize).to.equal(element.maxFontSize);
+    });
+
+    it('restores fontSize after setting autoFitHeight to false', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.height = 50;
+        element.text = 'ab\nab';
+        element.autoFitHeight = true;
+        expect(element.fontSize).to.not.equal(44);
+        element.autoFitHeight = false;
+        expect(element.fontSize).to.equal(44);
+    });
+
+    it('does not change fontSize after setting autoFitHeight to true while autoHeight is already true', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = true;
+        element.text = 'ab\nab';
+        expect(element.fontSize).to.equal(44);
+        element.autoFitHeight = true;
+        expect(element.fontSize).to.equal(44);
+    });
+
+    it('restores fontSize to maxFontSize after setting autoFitHeight to false if autoFitWidth is true', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.height = 50;
+        element.text = 'ab\nab';
+        element.autoFitHeight = true;
+        element.autoFitWidth = true;
+        expect(element.fontSize).to.not.equal(44);
+        element.autoFitHeight = false;
+        expect(element.fontSize).to.equal(element.maxFontSize);
+    });
+
+    it('restores fontSize if autoFitWidth is true and autoWidth becomes true', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.width = 10;
+        element.text = 'ab';
+        element.autoFitWidth = true;
+        expect(element.fontSize).to.not.equal(44);
+        element.autoWidth = true;
+        expect(element.fontSize).to.equal(44);
+    });
+
+    it('restores fontSize if autoFitHeight is true and autoHeight becomes true', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.height = 50;
+        element.text = 'ab\nab';
+        element.autoFitHeight = true;
+        expect(element.fontSize).to.not.equal(44);
+        element.autoHeight = true;
+        expect(element.fontSize).to.equal(44);
+    });
+
+    it('restores fontSize to maxFontSize when autoHeight becomes true while autoFitHeight and autoFitWidth are true', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.height = 50;
+        element.width = 1000;
+        element.text = 'ab\nab';
+        element.autoFitWidth = true;
+        element.autoFitHeight = true;
+        expect(element.fontSize).to.not.equal(44);
+        element.autoHeight = true;
+        expect(element.fontSize).to.equal(element.maxFontSize);
+    });
+
+    it('restores fontSize to maxFontSize when autoWidth becomes true while autoFitHeight and autoFitWidth are true', function () {
+        element.fontSize = 44;
+        element.fontAsset = fontAsset;
+        element.autoWidth = false;
+        element.autoHeight = false;
+        element.height = 1000;
+        element.text = 'ab';
+        element.autoFitWidth = true;
+        element.autoFitHeight = true;
+        expect(element.fontSize).to.not.equal(44);
+        element.autoWidth = true;
+        expect(element.fontSize).to.equal(element.maxFontSize);
+    });
+
+    it('AssetRegistry events unbound on destroy for font asset', function () {
+        const e = new Entity();
+
+        e.addComponent('element', {
+            type: 'text',
+            fontAsset: 123456
+        });
+
+        expect(app.assets.hasEvent('add:123456')).to.be.true;
+
+        e.destroy();
+
+        expect(app.assets.hasEvent('add:123456')).to.be.false;
+    });
+
+    it('Font assets unbound when reset', function () {
+        expect(assets.font.hasEvent('add')).to.be.false;
+        expect(assets.font.hasEvent('change')).to.be.false;
+        expect(assets.font.hasEvent('load')).to.be.false;
+        expect(assets.font.hasEvent('remove')).to.be.false;
+
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            fontAsset: assets.font
+        });
+
+        e.element.fontAsset = null;
+
+        expect(assets.font.hasEvent('add')).to.be.false;
+        expect(assets.font.hasEvent('change')).to.be.false;
+        expect(assets.font.hasEvent('load')).to.be.false;
+        expect(assets.font.hasEvent('remove')).to.be.false;
+    });
+
+    it('Font assets unbound when destroy', function () {
+        expect(assets.font.hasEvent('add')).to.be.false;
+        expect(assets.font.hasEvent('change')).to.be.false;
+        expect(assets.font.hasEvent('load')).to.be.false;
+        expect(assets.font.hasEvent('remove')).to.be.false;
+
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            fontAsset: assets.font
+        });
+
+        e.destroy();
+
+        expect(assets.font.hasEvent('add')).to.be.false;
+        expect(assets.font.hasEvent('change')).to.be.false;
+        expect(assets.font.hasEvent('load')).to.be.false;
+        expect(assets.font.hasEvent('remove')).to.be.false;
+    });
+
+    it('Font assets to be bound once when enabled late', function () {
+        expect(assets.font.hasEvent('add')).to.be.false;
+        expect(assets.font.hasEvent('change')).to.be.false;
+        expect(assets.font.hasEvent('load')).to.be.false;
+        expect(assets.font.hasEvent('remove')).to.be.false;
+
+        const e = new Entity();
+        e.enabled = false;
+        e.addComponent('element', {
+            type: 'text',
+            fontAsset: assets.font
+        });
+        app.root.addChild(e);
+
+        e.enabled = true;
+
+        e.element.fontAsset = null;
+
+        expect(assets.font.hasEvent('add')).to.be.false;
+        expect(assets.font.hasEvent('change')).to.be.false;
+        expect(assets.font.hasEvent('load')).to.be.false;
+        expect(assets.font.hasEvent('remove')).to.be.false;
+    });
+
+    it('CanvasFont render event is unbound when reset', function () {
+        const cf = new CanvasFont(app, {
+            fontName: 'Arial'
+        });
+
+        cf.createTextures('abc');
+
+        expect(cf.hasEvent('render')).to.be.false;
+
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            text: 'abc'
+        });
+        app.root.addChild(e);
+
+        e.element.font = cf;
+
+        expect(cf.hasEvent('render')).to.be.true;
+
+        e.element.font = null;
+
+        expect(cf.hasEvent('render')).to.be.false;
+    });
+
+    it('CanvasFont render event is unbound on destroy', function () {
+        const cf = new CanvasFont(app, {
+            fontName: 'Arial'
+        });
+
+        cf.createTextures('abc');
+
+        expect(cf.hasEvent('render')).to.be.false;
+
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            text: 'abc'
+        });
+        app.root.addChild(e);
+
+        e.element.font = cf;
+
+        expect(cf.hasEvent('render')).to.be.true;
+
+        e.destroy();
+
+        expect(cf.hasEvent('render')).to.be.false;
+    });
+
+    it('defaults to white color and opacity 1', function () {
+        element.fontAsset = fontAsset.id;
+        element.text = 'test';
+        expect(element.color.r).to.equal(1);
+        expect(element.color.g).to.equal(1);
+        expect(element.color.b).to.equal(1);
+        expect(element.opacity).to.equal(1);
+
+        const meshes = element._text._model.meshInstances;
+        expect(meshes.length).to.be.greaterThan(0);
+        for (let i = 0; i < meshes.length; i++) {
+            const color = meshes[i].getParameter('mesh_color').data;
+            expect(color[0]).to.equal(1);
+            expect(color[1]).to.equal(1);
+            expect(color[2]).to.equal(1);
+
+            const opacity = meshes[i].getParameter('mesh_color').data[3];
+            expect(opacity).to.equal(1);
+        }
+    });
+
+    it('uses color and opacity passed in addComponent data', function () {
+        const e = new Entity();
+        app.root.addChild(e);
+        e.addComponent('element', {
+            type: 'text',
+            text: 'test',
+            fontAsset: fontAsset.id,
+            color: [0.1, 0.2, 0.3],
+            opacity: 0.4
+        });
+
+        expect(e.element.color.r).to.be.closeTo(0.1, 0.001);
+        expect(e.element.color.g).to.be.closeTo(0.2, 0.001);
+        expect(e.element.color.b).to.be.closeTo(0.3, 0.001);
+        expect(e.element.opacity).to.be.closeTo(0.4, 0.001);
+
+        const linear = new Color(0.1, 0.2, 0.3).linear();
+        const meshes = e.element._text._model.meshInstances;
+        expect(meshes.length).to.be.greaterThan(0);
+        for (let i = 0; i < meshes.length; i++) {
+            const color = meshes[i].getParameter('mesh_color').data;
+            expect(color[0]).to.be.closeTo(linear.r, 0.001);
+            expect(color[1]).to.be.closeTo(linear.g, 0.001);
+            expect(color[2]).to.be.closeTo(linear.b, 0.001);
+
+            const opacity = meshes[i].getParameter('mesh_color').data[3];
+            expect(opacity).to.be.closeTo(0.4, 0.001);
+        }
+    });
+
+    it('changes color', function () {
+        element.fontAsset = fontAsset.id;
+        element.text = 'test';
+        element.color = new Color(0.1, 0.2, 0.3);
+
+        expect(element.color.r).to.be.closeTo(0.1, 0.001);
+        expect(element.color.g).to.be.closeTo(0.2, 0.001);
+        expect(element.color.b).to.be.closeTo(0.3, 0.001);
+        expect(element.opacity).to.be.closeTo(1, 0.001);
+
+        const linear = new Color(0.1, 0.2, 0.3).linear();
+        const meshes = element._text._model.meshInstances;
+        expect(meshes.length).to.be.greaterThan(0);
+        for (let i = 0; i < meshes.length; i++) {
+            const color = meshes[i].getParameter('mesh_color').data;
+            expect(color[0]).to.be.closeTo(linear.r, 0.001);
+            expect(color[1]).to.be.closeTo(linear.g, 0.001);
+            expect(color[2]).to.be.closeTo(linear.b, 0.001);
+
+            const opacity = meshes[i].getParameter('mesh_color').data[3];
+            expect(opacity).to.be.closeTo(1, 0.001);
+        }
+    });
+
+    it('changes opacity', function () {
+        element.fontAsset = fontAsset.id;
+        element.text = 'test';
+        element.opacity = 0.4;
+        expect(element.opacity).to.be.closeTo(0.4, 0.001);
+
+        const meshes = element._text._model.meshInstances;
+        expect(meshes.length).to.be.greaterThan(0);
+        for (let i = 0; i < meshes.length; i++) {
+            const opacity = meshes[i].getParameter('mesh_color').data[3];
+            expect(opacity).to.be.closeTo(0.4, 0.001);
+        }
+    });
+
+
+    it('Preserves independent text tint and opacity when switching markup', function () {
+        element.fontAsset = fontAsset.id;
+        element.text = 'test';
+        const other = new Entity();
+        app.root.addChild(other);
+        other.addComponent('element', { type: 'text', fontAsset: fontAsset.id, text: 'test' });
+        const otherMesh = other.element._text._model.meshInstances[0];
+        const mi = element._text._model.meshInstances[0];
+        expect(mi.material).to.equal(otherMesh.material);
+        element.color = new Color(0.5, 0.25, 0.75);
+        element.opacity = 0.25;
+        const color = mi.getParameter('mesh_color').data;
+        const rgb = Array.from(color).slice(0, 3);
+        element.opacity = 0.75;
+        expect(Array.from(color).slice(0, 3)).to.deep.equal(rgb);
+        expect(color[3]).to.equal(0.75);
+        expect(mi.material.getParameter('mesh_color')).to.be.undefined;
+        expect(mi.getParameter('material_emissive')).to.be.undefined;
+        expect(mi.getParameter('material_opacity')).to.be.undefined;
+        expect(Array.from(otherMesh.getParameter('mesh_color').data)).to.deep.equal([1, 1, 1, 1]);
+
+        element.enableMarkup = true;
+        element.text = '[color="#ff0000"]test[/color]';
+        expect(Array.from(color)).to.deep.equal([1, 1, 1, 0.75]);
+        element.color = new Color(0.25, 0.5, 0.75);
+        element.opacity = 0.5;
+        expect(Array.from(color)).to.deep.equal([1, 1, 1, 0.5]);
+        element.enableMarkup = false;
+        const linear = element.color.clone().linear();
+        expect(color[0]).to.be.closeTo(linear.r, 0.000001);
+        expect(color[1]).to.be.closeTo(linear.g, 0.000001);
+        expect(color[2]).to.be.closeTo(linear.b, 0.000001);
+        expect(color[3]).to.equal(0.5);
+    });
+
+    it('Updates mesh color on every bitmap font atlas mesh', function () {
+        const font = new CanvasFont(app, { fontName: 'Arial', fontSize: 40, width: 128, height: 128 });
+        const text = 'ABCDEFGHIJKLMNOP0123456789';
+        font.createTextures(`${text} `);
+        element.font = font;
+        element.text = text;
+        const meshes = element._text._model.meshInstances;
+        expect(meshes.length).to.be.greaterThan(1);
+        element.color = new Color(0.5, 0.25, 0.75);
+        element.opacity = 0.25;
+        const color = meshes[0].getParameter('mesh_color').data;
+        for (const mi of meshes) {
+            expect(mi.getParameter('mesh_color').data).to.equal(color);
+            expect(mi.getParameter('material_emissive')).to.be.undefined;
+            expect(mi.getParameter('material_opacity')).to.be.undefined;
+        }
+        element.opacity = 0.75;
+        for (const mi of meshes) {
+            expect(mi.getParameter('mesh_color').data[3]).to.equal(0.75);
+        }
+        entity.destroy();
+        font.destroy();
+    });
+
+    it('cloned text component is complete', function () {
+        const e = new Entity();
+
+        e.addComponent('element', {
+            type: 'text',
+            text: 'test',
+            fontAsset: assets.font
+        });
+
+        const clone = e.clone();
+
+        expect(e.element.fontAsset).to.be.ok;
+
+        expect(clone.element.text).to.equal(e.element.text);
+        expect(clone.element.fontAsset).to.equal(e.element.fontAsset);
+        expect(clone.element.font).to.equal(e.element.font);
+        expect(clone.element.color).to.deep.equal(e.element.color);
+        expect(clone.element.spacing).to.equal(e.element.spacing);
+        expect(clone.element.fontSize).to.equal(e.element.fontSize);
+        expect(clone.element.lineHeight).to.equal(e.element.lineHeight);
+        expect(clone.element.alignment).to.deep.equal(e.element.alignment);
+        expect(clone.element.wrapLines).to.equal(e.element.wrapLines);
+        expect(clone.element.autoWidth).to.equal(e.element.autoWidth);
+        expect(clone.element.autoHeight).to.equal(e.element.autoHeight);
+    });
+
+    it('clears font asset when font is assigned directly', function () {
+        const e = new Entity();
+
+        e.addComponent('element', {
+            type: 'text',
+            text: '',
+            fontAsset: assets.font
+        });
+
+        const font = new CanvasFont(app);
+        font.createTextures(' ');
+
+        e.element.font = font;
+
+        expect(e.element.font).to.equal(font);
+        expect(e.element.fontAsset).to.equal(null);
+    });
+
+
+    it('Offscreen element is culled', function () {
+        const canvasWidth = app.graphicsDevice.width;
+
+        const screen = new Entity();
+        screen.addComponent('screen', {
+            screenSpace: true
+        });
+        app.root.addChild(screen);
+
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            text: 'test',
+            fontAsset: fontAsset,
+            autoWidth: false,
+            autoHeight: false,
+            width: 100,
+            height: 100,
+            pivot: [0.5, 0.5]
+        });
+        screen.addChild(e);
+
+        const camera = new Entity();
+        camera.addComponent('camera');
+        app.root.addChild(camera);
+
+        // update transform
+        app.update(0.1);
+        app.render();
+
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.true;
+
+        // move just off screen
+        e.translateLocal(canvasWidth + (100 / 2) + 0.001, 0, 0);
+
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.false;
+
+        // move just on screen
+        e.translateLocal(-1, 0, 0);
+
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.true;
+
+    });
+
+    it('Offscreen autowidth element is culled', function () {
+        const canvasWidth = app.graphicsDevice.width;
+
+        const screen = new Entity();
+        screen.addComponent('screen', {
+            screenSpace: true
+        });
+        app.root.addChild(screen);
+
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            text: 'test',
+            fontAsset: fontAsset,
+            autoWidth: true,
+            autoHeight: false,
+            width: 100,
+            height: 100,
+            pivot: [0.5, 0.5]
+        });
+        screen.addChild(e);
+
+        const camera = new Entity();
+        camera.addComponent('camera');
+        app.root.addChild(camera);
+
+        // update transform
+        app.update(0.1);
+        app.render();
+
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.true;
+
+        // move just off screen
+        e.translateLocal(canvasWidth + (e.element.width / 2) + 0.001, 0, 0);
+
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.false;
+
+        // move just on screen
+        e.translateLocal(-1, 0, 0);
+
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.true;
+    });
+
+    it('Offscreen child element is culled', function () {
+        const screen = new Entity();
+        screen.addComponent('screen', {
+            screenSpace: true
+        });
+        app.root.addChild(screen);
+
+        const parent = new Entity();
+        parent.addComponent('element', {
+            type: 'text',
+            text: 'test',
+            fontAsset: fontAsset,
+            autoWidth: false,
+            autoHeight: false,
+            width: 100,
+            height: 100,
+            pivot: [0.5, 0.5]
+        });
+        screen.addChild(parent);
+
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            text: 'test',
+            fontAsset: fontAsset,
+            autoWidth: false,
+            autoHeight: false,
+            width: 100,
+            height: 100,
+            pivot: [0.5, 0.5]
+        });
+        parent.addChild(e);
+
+        const camera = new Entity();
+        camera.addComponent('camera');
+        app.root.addChild(camera);
+
+        // update transform
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.true;
+
+        // move just off screen
+        parent.translateLocal(50, 50, 0);
+        e.translateLocal(351, 50, 0);
+
+        // update transform
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.false;
+    });
+
+
+    it('Offscreen rotated element is culled', function () {
+        const screen = new Entity();
+        screen.addComponent('screen', {
+            screenSpace: true
+        });
+        app.root.addChild(screen);
+
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            text: 'test',
+            fontAsset: fontAsset,
+            autoWidth: false,
+            autoHeight: false,
+            width: 100,
+            height: 100,
+            pivot: [0.5, 0.5]
+        });
+        screen.addChild(e);
+
+        const camera = new Entity();
+        camera.addComponent('camera');
+        app.root.addChild(camera);
+
+        // move just off screen (when rotated 45°)
+        e.translateLocal(300 + (50 * Math.sqrt(2)), 0, 0);
+        e.rotateLocal(0, 0, 45);
+
+        // update transform
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.false;
+    });
+
+    it('Offscreen rotated out of plane is culled', function () {
+        const screen = new Entity();
+        screen.addComponent('screen', {
+            screenSpace: true
+        });
+        app.root.addChild(screen);
+
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            text: 'test',
+            fontAsset: fontAsset,
+            autoWidth: false,
+            autoHeight: false,
+            width: 100,
+            height: 100,
+            pivot: [0.5, 0.5]
+        });
+        screen.addChild(e);
+
+        const camera = new Entity();
+        camera.addComponent('camera');
+        app.root.addChild(camera);
+
+        // move just off screen (when rotated 45°)
+        e.translateLocal(300, 0, 0);
+        e.rotateLocal(0, 90, 0);
+
+        // update transform
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.false;
+    });
+
+    it('Masked text is not culled when its wrapped content overflows the element box (#4615)', function () {
+        // screen-space screens enable element culling
+        const screen = new Entity();
+        screen.addComponent('screen', {
+            screenSpace: true
+        });
+        app.root.addChild(screen);
+
+        const camera = new Entity();
+        camera.addComponent('camera');
+        app.root.addChild(camera);
+
+        // masking image element, centered on the screen
+        const mask = new Entity();
+        mask.addComponent('element', {
+            type: 'image',
+            mask: true,
+            anchor: [0.5, 0.5, 0.5, 0.5],
+            pivot: [0.5, 0.5],
+            width: 200,
+            height: 100
+        });
+        screen.addChild(mask);
+
+        // child text whose wrapped content is much taller than its one-line box
+        const e = new Entity();
+        e.addComponent('element', {
+            type: 'text',
+            text: 'the quick brown fox jumps over the lazy dog and keeps on running for a while',
+            fontAsset: fontAsset,
+            anchor: [0.5, 0.5, 0.5, 0.5],
+            pivot: [0.5, 0.5],
+            alignment: [0.5, 0.5],
+            autoWidth: false,
+            autoHeight: false,
+            wrapLines: true,
+            width: 150,
+            height: 20
+        });
+        mask.addChild(e);
+
+        app.update(0.1);
+        app.render();
+
+        // sanity: the text is masked and its rendered content overflows its box vertically
+        expect(e.element.maskedBy).to.equal(mask);
+        const contentHeight = e.element._text.height;
+        expect(contentHeight).to.be.greaterThan(e.element.calculatedHeight);
+
+        // centered over the mask -> visible
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.true;
+
+        // move the box clear of the mask, but by less than the content overflow, so the wrapped
+        // glyphs still reach into the mask region. The box alone is outside the mask (the old
+        // box-based test culled it here), but the rendered text is not, so it must stay visible.
+        e.setLocalPosition(0, -(55 + contentHeight / 4), 0);
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.true;
+
+        // move it far enough that even the overflowing content clears the mask -> culled
+        e.setLocalPosition(0, -(contentHeight / 2 + 100), 0);
+        app.update(0.1);
+        app.render();
+        expect(e.element.isVisibleForCamera(camera.camera.camera)).to.be.false;
+    });
+
+    it('text is set to translated text when we set the key', function () {
+        addText('en-US', 'key', 'translation');
+        element.fontAsset = fontAsset;
+        element.key = 'key';
+        assertLineContents(['translation']);
+    });
+
+    it('text is not translated when we set the text property', function () {
+        addText('en-US', 'key', 'translation');
+        element.fontAsset = fontAsset;
+        element.text = 'key';
+        assertLineContents(['key']);
+        expect(element.key).to.equal(null);
+    });
+
+    it('text changes language when we change the locale', function () {
+        addText('en-US', 'key', 'translation');
+        addText('fr-FR', 'key', 'french');
+        element.fontAsset = fontAsset;
+        element.key = 'key';
+        assertLineContents(['translation']);
+        app.i18n.locale = 'fr-FR';
+        assertLineContents(['french']);
+    });
+
+    it('text changes language when we add translations for the current locale', function () {
+        element.fontAsset = fontAsset;
+        element.key = 'key';
+        assertLineContents(['key']);
+        addText('en-US', 'key', 'translation');
+        assertLineContents(['translation']);
+    });
+
+    it('text changes to first plural entry when the key is plural', function () {
+        element.fontAsset = fontAsset;
+        element.key = 'key';
+        assertLineContents(['key']);
+        addText('en-US', 'key', ['one', 'other']);
+        assertLineContents(['one']);
+    });
+
+    it('cloning text element clones the localization key', function () {
+        addText('en-US', 'key', 'translation');
+        element.fontAsset = fontAsset;
+        element.key = 'key';
+
+        const clone = element.entity.clone();
+        expect(clone.element.key).to.equal('key');
+        expect(clone.element.text).to.equal('translation');
+    });
+
+    it('cloning text element with no localization key clones text correctly', function () {
+        addText('en-US', 'key', 'translation');
+        element.fontAsset = fontAsset;
+        element.text = 'text';
+
+        const clone = element.entity.clone();
+        expect(clone.element.key).to.equal(null);
+        expect(clone.element.text).to.equal('text');
+    });
+
+    it('text does not wrap when its width reaches exactly the width of the element', function () {
+        element.fontAsset = fontAsset;
+        element.wrapLines = true;
+        element.autoWidth = true;
+        element.text = 'abcd';
+        assertLineContents(['abcd']);
+
+        element.autoWidth = false;
+        element.text = '';
+        element.text = 'abcd';
+        // should not wrap
+        assertLineContents(['abcd']);
+
+        element.text = 'abcde';
+        // now it should wrap
+        assertLineContents(['abcd', 'e']);
+    });
+
+    it('changing the locale changes the font asset', function (done) {
+        assets.font2 = new Asset('roboto-bold.json', 'font', {
+            url: '/test/assets/fonts/roboto-bold.json'
+        });
+
+        app.assets.add(assets.font2);
+
+        assets.font2.on('load', function () {
+            setTimeout(function () {
+                expect(element.fontAsset).to.equal(assets.font2.id);
+                expect(element.font).to.equal(assets.font2.resource);
+                done();
+            });
+        });
+
+        fontAsset.addLocalizedAssetId('fr', assets.font2.id);
+
+        addText('en-US', 'key', 'translation');
+        addText('fr', 'key', 'french translation');
+        element.fontAsset = fontAsset;
+        element.key = 'key';
+
+        app.i18n.locale = 'fr';
+    });
+
+    it('does not render the previous locale text when a cached localized font is swapped in on locale change', function (done) {
+        assets.font2 = new Asset('roboto-bold.json', 'font', {
+            url: '/test/assets/fonts/roboto-bold.json'
+        });
+
+        app.assets.add(assets.font2);
+        app.assets.load(assets.font2);
+
+        assets.font2.on('load', function () {
+            setTimeout(function () {
+                // both the default and localized fonts are now loaded (cached)
+                fontAsset.addLocalizedAssetId('fr', assets.font2.id);
+                addText('en-US', 'key', 'english');
+                addText('fr', 'key', 'french');
+                element.fontAsset = fontAsset;
+                element.key = 'key';
+
+                // switch to the localized font; cached so it is applied synchronously
+                app.i18n.locale = 'fr';
+                expect(element.text).to.equal('french');
+                expect(element.font).to.equal(assets.font2.resource);
+
+                // record the text rendered on every update during the next locale change
+                const textElement = element._text;
+                const updateText = textElement._updateText;
+                const renderedTexts = [];
+                textElement._updateText = function (text) {
+                    renderedTexts.push(text === undefined ? this._text : text);
+                    return updateText.call(this, text);
+                };
+
+                // switching back swaps in the cached default font; it must never be
+                // rendered with the previous (french) string
+                app.i18n.locale = 'en-US';
+                textElement._updateText = updateText;
+
+                expect(renderedTexts).to.not.include('french');
+                expect(element.text).to.equal('english');
+                expect(element.font).to.equal(assets.font.resource);
+                done();
+            });
+        });
+    });
+
+    it('text element that does not use localization uses the default font asset not its localized variant', function (done) {
+        assets.font2 = new Asset('roboto-bold.json', 'font', {
+            url: '/test/assets/fonts/roboto-bold.json'
+        });
+
+        app.assets.add(assets.font2);
+        app.assets.load(assets.font2);
+
+        assets.font2.on('load', function () {
+            app.i18n.locale = 'fr';
+            setTimeout(function () {
+                expect(element.font).to.equal(assets.font.resource);
+                expect(element.fontAsset).to.equal(assets.font.id);
+                done();
+            });
+        });
+
+        fontAsset.addLocalizedAssetId('fr', assets.font2.id);
+        element.fontAsset = fontAsset;
+        element.text = 'text';
+    });
+
+    it('if text element is disabled it does not automatically load localizedAssets', function () {
+        assets.font2 = new Asset('roboto-bold.json', 'font', {
+            url: '/test/assets/fonts/roboto-bold.json'
+        });
+
+        app.assets.add(assets.font2);
+
+        fontAsset.addLocalizedAssetId('fr', assets.font2.id);
+
+        addText('en-US', 'key', 'translation');
+        addText('fr', 'key', 'french translation');
+        element.fontAsset = fontAsset;
+        element.key = 'key';
+
+        entity.element.enabled = false;
+
+        app.i18n.locale = 'fr';
+
+        expect(assets.font2.hasEvent('load')).to.equal(false);
+    });
+
+    it('text element removes i18n event listeners on destroy', function () {
+        expect(app.i18n.hasEvent('change')).to.equal(true);
+        expect(app.i18n.hasEvent('data:add')).to.equal(true);
+        expect(app.i18n.hasEvent('data:remove')).to.equal(true);
+
+        element.entity.destroy();
+
+        expect(app.i18n.hasEvent('change')).to.equal(false);
+        expect(app.i18n.hasEvent('data:add')).to.equal(false);
+        expect(app.i18n.hasEvent('data:remove')).to.equal(false);
+    });
+
+    it('text markup color tag', function () {
+        registerRtlHandler('\r');
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+        element.enableMarkup = true;
+        element.autoWidth = true;
+
+        element.text = 'text element [color="#ff0000"]in red[/color] or not';
+
+        assertLineContents([
+            'text element in red or not'
+        ]);
+
+        const w = [255, 255, 255];
+        const r = [255, 0, 0];
+        assertLineColors([
+            w, w, w, w, w, w, w, w, w, w, w, w, w, r, r, r, r, r, r, w, w, w, w, w, w, w
+        ]);
+    });
+
+    it('text markup color without closing tag', function () {
+        element.fontAsset = fontAsset;
+        element.enableMarkup = true;
+        element.autoWidth = true;
+
+        element.text = 'text element [color="#ff0000"]in red or not';
+        assertLineContents([
+            'text element [color="#ff0000"]in red or not'
+        ]);
+
+        assertLineColors(new Array(43).fill([255, 255, 255]));
+    });
+
+    it('text markup with escaping open bracket', function () {
+        element.fontAsset = fontAsset;
+        element.enableMarkup = true;
+        element.autoWidth = true;
+
+        element.text = 'text element \\[color="#ff0000"]in red or not';
+        assertLineContents([
+            'text element [color="#ff0000"]in red or not'
+        ]);
+
+        assertLineColors(new Array(43).fill([255, 255, 255]));
+    });
+
+    it('text markup shadow tag', function () {
+        registerRtlHandler('\r');
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+        element.enableMarkup = true;
+        element.autoWidth = true;
+        element.shadowColor = new Color(1, 1, 0, 1);
+        element.shadowOffset = new Vec2(0.5, -1);
+
+        element.text = 'text [shadow color="#00ff00bb" offset="1"]element[/shadow] [shadow color="#ff0000"]in red[/shadow] [shadow offset="1"]or[/shadow] not';
+
+        assertLineContents([
+            'text element in red or not'
+        ]);
+
+        // (r, g, b, a, offsetx, offsety)
+        const d1 = [255, 255, 0, 255, 64, -127];
+        const g = [0, 255, 0, 187, 127, 127];
+        const r = [255, 0, 0, 255, 64, -127];
+        const d2 = [255, 255, 0, 255, 127, 127];
+
+        assertLineShadowParams([
+            d1, d1, d1, d1, d1,
+            g, g, g, g, g, g, g, d1,
+            r, r, r, r, r, r, d1,
+            d2, d2, d1,
+            d1, d1, d1
+        ]);
+    });
+
+    it('text markup outline tag', function () {
+        registerRtlHandler('\r');
+        element.fontAsset = fontAsset;
+        element.rtlReorder = true;
+        element.enableMarkup = true;
+        element.autoWidth = true;
+        element.outlineColor = new Color(1, 1, 0, 1);
+        element.outlineThickness = 1;
+
+        element.text = 'text [outline color="#00ff00bb" thickness="0.5"]element[/outline] [outline color="#ff0000"]in red[/outline] [outline thickness="1"]or[/outline] not';
+
+        assertLineContents([
+            'text element in red or not'
+        ]);
+
+        // (r, g, b, a, thickness)
+        const d1 = [255, 255, 0, 255, 255];
+        const g = [0, 255, 0, 187, 128];
+        const r = [255, 0, 0, 255, 255];
+        const d2 = [255, 255, 0, 255, 255];
+
+        assertLineOutlineParams([
+            d1, d1, d1, d1, d1,
+            g, g, g, g, g, g, g, d1,
+            r, r, r, r, r, r, d1,
+            d2, d2, d1,
+            d1, d1, d1
+        ]);
+    });
+
+    it('text markup with attributes', function () {
+        element.fontAsset = fontAsset;
+        element.enableMarkup = true;
+        element.autoWidth = true;
+
+        element.text = 'abcd efgh [tag attr1="1" attr2="2"]ijkl[/tag] mnop';
+        assertLineContents([
+            'abcd efgh ijkl mnop'
+        ]);
+
+        const w = [255, 255, 255];
+        assertLineColors([
+            w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w
+        ]);
+    });
+
+    // min and max corners of the glyph quads laid out in the first mesh
+    function quadBounds() {
+        const meshInfo = element._text._meshInfo[0];
+        const min = new Vec3(Infinity, Infinity, Infinity);
+        const max = new Vec3(-Infinity, -Infinity, -Infinity);
+        for (let v = 0; v < meshInfo.quad * 4; v++) {
+            const x = meshInfo.positions[v * 3];
+            const y = meshInfo.positions[v * 3 + 1];
+            const z = meshInfo.positions[v * 3 + 2];
+            min.set(Math.min(min.x, x), Math.min(min.y, y), Math.min(min.z, z));
+            max.set(Math.max(max.x, x), Math.max(max.y, y), Math.max(max.z, z));
+        }
+        return { min, max };
+    }
+
+    it('never computes a NaN text mesh bounding box', function () {
+        const compute = BoundingBox.prototype.compute;
+        const boxes = [];
+        BoundingBox.prototype.compute = function (vertices, numVerts) {
+            compute.call(this, vertices, numVerts);
+            boxes.push([...this.getMin().toArray(), ...this.getMax().toArray()]);
+        };
+
+        try {
+            element.fontAsset = fontAsset;
+            element.text = 'ab\n';
+            element.text = 'abc\n\n';
+            element.text = '\n';
+        } finally {
+            BoundingBox.prototype.compute = compute;
+        }
+
+        expect(boxes).to.not.be.empty;
+        for (const box of boxes) {
+            expect(box.every(Number.isFinite), box.join(', ')).to.equal(true);
+        }
+
+        const aabb = element._text._meshInfo[0].meshInstance.mesh.aabb;
+        expect(aabb.center.toArray()).to.deep.equal([0, 0, 0]);
+        expect(aabb.halfExtents.toArray()).to.deep.equal([0, 0, 0]);
+    });
+
+    it('bounds only the glyphs of the current text', function () {
+        element.fontAsset = fontAsset;
+        element.text = 'abcd';
+        element.text = 'ab\n\n';
+
+        // same symbol count, so the mesh is reused and the last two quads are cleared
+        const meshInfo = element._text._meshInfo[0];
+        expect(meshInfo.count).to.equal(4);
+        expect(meshInfo.quad).to.equal(2);
+
+        const { min, max } = quadBounds();
+        const aabb = meshInfo.meshInstance.mesh.aabb;
+        expect(aabb.getMin().distance(min)).to.be.closeTo(0, 1e-5);
+        expect(aabb.getMax().distance(max)).to.be.closeTo(0, 1e-5);
+    });
+
+    it('builds text meshes of front facing quads', function () {
+        element.fontAsset = fontAsset;
+        element.text = 'abc';
+
+        const mesh = element._text._meshInfo[0].meshInstance.mesh;
+        expect(mesh.primitive[0].indexed).to.equal(true);
+        expect(mesh.primitive[0].count).to.equal(18);
+        const indices = [];
+        mesh.getIndices(indices);
+        expect(indices).to.deep.equal([
+            0, 1, 3, 2, 3, 1,
+            4, 5, 7, 6, 7, 5,
+            8, 9, 11, 10, 11, 9
+        ]);
+
+        const normals = [];
+        mesh.getNormals(normals);
+        expect(normals).to.deep.equal([].concat(...Array(12).fill([0, 0, -1])));
+    });
+
+    it('does not draw text with an empty render range', function () {
+        element.fontAsset = fontAsset;
+        element.text = 'abc';
+        const meshInstance = element._text._meshInfo[0].meshInstance;
+
+        element.rangeEnd = 0;
+        expect(meshInstance.visible).to.equal(false);
+
+        element.rangeEnd = 3;
+        expect(meshInstance.visible).to.equal(true);
+
+        element.rangeStart = 1;
+        element.rangeEnd = 1;
+        expect(meshInstance.visible).to.equal(false);
+
+        // new text of the same length reuses the mesh and resets the range to the whole text
+        element.text = 'xyz';
+        expect(element._text._meshInfo[0].meshInstance).to.equal(meshInstance);
+        expect(meshInstance.visible).to.equal(true);
+    });
+
+    it('does not draw the texture pages with no characters in the render range', function () {
+        // the test font with 'b' moved to a second texture page
+        const data = structuredClone(fontAsset.resource.data);
+        data.info.maps.push({ ...data.info.maps[0] });
+        data.chars.b.map = 1;
+        const texture = fontAsset.resource.textures[0];
+        element.font = new Font([texture, texture], data);
+        element.text = 'ab';
+        const [pageA, pageB] = element._text._meshInfo.map(info => info.meshInstance);
+
+        element.rangeEnd = 1;
+        expect(pageA.visible).to.equal(true);
+        expect(pageB.visible).to.equal(false);
+
+        element.rangeStart = 1;
+        element.rangeEnd = 2;
+        expect(pageA.visible).to.equal(false);
+        expect(pageB.visible).to.equal(true);
+    });
+
+    describe('#letterSpacing', function () {
+
+        // distance from the left edge of each glyph quad to the left edge of the next one
+        function glyphSteps() {
+            const lefts = quadLefts();
+            return lefts.slice(1).map((left, i) => left - lefts[i]);
+        }
+
+        beforeEach(function () {
+            element.fontAsset = fontAsset;
+            element.autoWidth = true;
+            element.wrapLines = false;
+        });
+
+        it('defaults to 0', function () {
+            expect(element.letterSpacing).to.equal(0);
+        });
+
+        it('adds the same space between every pair of characters, however wide they are', function () {
+            element.text = 'MIW I';
+            const steps = glyphSteps();
+
+            element.letterSpacing = 0.25;
+            const spaced = glyphSteps();
+            expect(spaced.length).to.equal(4);
+            for (let i = 0; i < steps.length; i++) {
+                expect(spaced[i] - steps[i]).to.be.closeTo(0.25 * element.fontSize, 1e-4);
+            }
+        });
+
+        it('does not widen a line past its last character', function () {
+            element.text = 'MIWI';
+            const width = element.width;
+            element.letterSpacing = 0.25;
+            expect(element.width).to.be.closeTo(width + 3 * 0.25 * element.fontSize, 1e-4);
+
+            element.text = 'M';
+            const spacedSingle = element.width;
+            element.letterSpacing = 0;
+            expect(element.width).to.be.closeTo(spacedSingle, 1e-4);
+        });
+
+        it('tightens the text when negative', function () {
+            element.text = 'MIWI';
+            const width = element.width;
+            element.letterSpacing = -0.05;
+            expect(element.width).to.be.closeTo(width - 3 * 0.05 * element.fontSize, 1e-4);
+        });
+
+        it('scales with the font size', function () {
+            element.letterSpacing = 0.25;
+            element.text = 'MIWI';
+            const width = element.width;
+            element.fontSize *= 2;
+            expect(element.width).to.be.closeTo(width * 2, 1e-4);
+        });
+
+        it('is added on top of spacing', function () {
+            element.text = 'MIWI';
+            element.spacing = 1.5;
+            const steps = glyphSteps();
+
+            element.letterSpacing = 0.25;
+            const spaced = glyphSteps();
+            for (let i = 0; i < steps.length; i++) {
+                expect(spaced[i] - steps[i]).to.be.closeTo(0.25 * element.fontSize, 1e-4);
+            }
+        });
+
+        it('is taken into account when wrapping lines', function () {
+            element.text = 'abcde fghij';
+            const width = element.width;
+
+            element.autoWidth = false;
+            element.wrapLines = true;
+            element.width = width + 1;
+            assertLineContents(['abcde fghij']);
+
+            element.letterSpacing = 0.25;
+            assertLineContents(['abcde ', 'fghij']);
+        });
+
+        it('starts a wrapped line without space in front of its first character', function () {
+            element.letterSpacing = 0.25;
+            element.text = 'abcde';
+            const firstWidth = element.width;
+            element.text = 'fghij';
+            const secondWidth = element.width;
+
+            element.autoWidth = false;
+            element.wrapLines = true;
+            element.width = Math.max(firstWidth, secondWidth) + 1;
+            const alone = quadLefts();
+
+            element.text = 'abcde fghij';
+            assertLineContents(['abcde ', 'fghij']);
+            const wrapped = quadLefts().slice(6);
+            for (let i = 0; i < alone.length; i++) {
+                expect(wrapped[i]).to.be.closeTo(alone[i], 1e-4);
+            }
+        });
+
+        it('does not add space around zero width control characters missing from the font', function () {
+            element.letterSpacing = 0.25;
+            element.text = 'ab';
+            const width = element.width;
+
+            element.text = '‎a​b';
+            expect(element.width).to.be.closeTo(width, 1e-4);
+        });
+
+        it('does not add space around zero width control characters the font supplies', function () {
+            // the test font with zero advance glyphs for the controls, as a CanvasFont creates them
+            const data = structuredClone(fontAsset.resource.data);
+            for (const char of ['​', '‎']) {
+                data.chars[char] = {
+                    ...data.chars.a,
+                    id: char.codePointAt(0),
+                    letter: char,
+                    width: 0,
+                    height: 0,
+                    xadvance: 0
+                };
+            }
+            element.font = new Font(fontAsset.resource.textures, data);
+            element.letterSpacing = 0.25;
+            element.text = 'ab';
+            const width = element.width;
+
+            element.text = '‎a​b';
+            expect(element.width).to.be.closeTo(width, 1e-4);
+            assertLineContents(['‎a​b']);
+        });
+
+        it('spaces rtl text evenly, to the same width as ltr text', function () {
+            element.letterSpacing = 0.25;
+            element.text = 'MIWI';
+            const ltrWidth = element.width;
+
+            registerRtlHandler();
+            element.rtlReorder = true;
+            element.letterSpacing = 0;
+            element.text = 'MIWI';
+            const steps = glyphSteps();
+
+            element.letterSpacing = 0.25;
+            expect(element.width).to.be.closeTo(ltrWidth, 1e-4);
+            const spaced = glyphSteps();
+            for (let i = 0; i < steps.length; i++) {
+                expect(Math.abs(spaced[i] - steps[i])).to.be.closeTo(0.25 * element.fontSize, 1e-4);
+            }
+        });
+
+        it('is set from the component data and kept by a clone', function () {
+            const e = new Entity();
+            e.addComponent('element', {
+                type: 'text',
+                text: 'test',
+                fontAsset: assets.font,
+                letterSpacing: 0.3
+            });
+
+            expect(e.element.letterSpacing).to.equal(0.3);
+            expect(e.clone().element.letterSpacing).to.equal(0.3);
+        });
+    });
+
+});

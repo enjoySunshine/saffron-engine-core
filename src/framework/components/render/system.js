@@ -1,0 +1,143 @@
+import { Vec3 } from '../../../core/math/vec3.js';
+import { BoundingBox } from '../../../core/shape/bounding-box.js';
+import { getDefaultMaterial } from '../../../scene/materials/default-material.js';
+import { ComponentSystem } from '../system.js';
+import { RenderComponent } from './component.js';
+
+/**
+ * @import { AppBase } from '../../app-base.js'
+ * @import { Entity } from '../../entity.js'
+ */
+
+/**
+ * Options of the `render` component accepted by {@link RenderComponentSystem} that differ from the
+ * properties of {@link RenderComponent}. Each replaces the same-named property of the options that
+ * {@link Entity#addComponent} derives from the component class; see
+ * {@link ComponentOptionsOverrides}.
+ *
+ * @typedef {object} RenderComponentOptionsOverrides
+ * @property {number[]} [aabbCenter] - Center `[x, y, z]` of a custom bounding box; with
+ * `aabbHalfExtents`, sets {@link RenderComponent#customAabb}.
+ * @property {number[]} [aabbHalfExtents] - Half-extents `[x, y, z]` of a custom bounding box; with
+ * `aabbCenter`, sets {@link RenderComponent#customAabb}.
+ * @property {number | null} [batchGroupId] - Same as {@link RenderComponent#batchGroupId}. `null`
+ * selects no batch group.
+ * @ignore
+ */
+
+// order matters here
+const _properties = [
+    'material',
+    'meshInstances',
+    'asset',
+    'materialAssets',
+    'castShadows',
+    'shadowCascadeMask',
+    'receiveShadows',
+    'clippingPlanes',
+    'clipIntersection',
+    'castShadowsLightmap',
+    'lightmapped',
+    'lightmapSizeMultiplier',
+    'renderStyle',
+    'type',
+    'layers',
+    'isStatic',
+    'batchGroupId',
+    'rootBone'
+];
+
+/**
+ * Allows an Entity to render a mesh or a primitive shape like a box, capsule, sphere, cylinder,
+ * cone etc.
+ *
+ * @category Graphics
+ */
+class RenderComponentSystem extends ComponentSystem {
+    /**
+     * Create a new RenderComponentSystem.
+     *
+     * @param {AppBase} app - The Application.
+     * @ignore
+     */
+    constructor(app) {
+        super(app);
+
+        this.id = 'render';
+
+        this.ComponentType = RenderComponent;
+
+        // consumed to build customAabb, not settable component properties
+        this.extraDataProperties = ['aabbCenter', 'aabbHalfExtents'];
+
+        this.defaultMaterial = getDefaultMaterial(app.graphicsDevice);
+
+        this.on('beforeremove', this.onBeforeRemove, this);
+    }
+
+    initializeComponentData(component, _data, properties) {
+        if (_data.batchGroupId === null || _data.batchGroupId === undefined) {
+            _data.batchGroupId = -1;
+        }
+
+        // duplicate layer list
+        if (_data.layers && _data.layers.length) {
+            _data.layers = _data.layers.slice(0);
+        }
+
+        for (let i = 0; i < _properties.length; i++) {
+            if (_data.hasOwnProperty(_properties[i])) {
+                component[_properties[i]] = _data[_properties[i]];
+            }
+        }
+
+        if (_data.aabbCenter && _data.aabbHalfExtents) {
+            component.customAabb = new BoundingBox(new Vec3(_data.aabbCenter), new Vec3(_data.aabbHalfExtents));
+        }
+
+        super.initializeComponentData(component, _data);
+    }
+
+    cloneComponent(entity, clone) {
+
+        // copy properties, and the clipping planes as assigned, without changes to the returned
+        // planes that are not assigned
+        const data = {};
+        for (let i = 0; i < _properties.length; i++) {
+            const property = _properties[i];
+            if (property !== 'clippingPlanes') {
+                data[property] = entity.render[property];
+            }
+        }
+        data.clippingPlanes = entity.render._clipPlanes?.assigned ?? null;
+        data.enabled = entity.render.enabled;
+
+        // mesh instances cannot be used this way, remove them and manually clone them later
+        delete data.meshInstances;
+
+        // clone component
+        const component = this.addComponent(clone, data);
+
+        // clone mesh instances
+        const srcMeshInstances = entity.render.meshInstances;
+        const meshes = srcMeshInstances.map(mi => mi.mesh);
+        component._onSetMeshes(meshes);
+
+        // assign materials
+        for (let m = 0; m < srcMeshInstances.length; m++) {
+            component.meshInstances[m].material = srcMeshInstances[m].material;
+        }
+
+        if (entity.render.customAabb) {
+            component.customAabb = entity.render.customAabb.clone();
+        }
+
+        return component;
+    }
+
+    onBeforeRemove(entity, component) {
+        component.onBeforeRemove();
+    }
+}
+
+export { RenderComponentSystem };

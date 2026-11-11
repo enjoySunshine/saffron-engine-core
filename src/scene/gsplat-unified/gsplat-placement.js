@@ -1,0 +1,373 @@
+import { Debug } from '../../core/debug.js';
+import { GSplatStreams } from '../gsplat/gsplat-streams.js';
+import { WORKBUFFER_UPDATE_AUTO, WORKBUFFER_UPDATE_ONCE } from '../constants.js';
+import { GsplatAllocId } from './gsplat-alloc-id.js';
+
+/**
+ * @import { BoundingBox } from '../../core/shape/bounding-box.js'
+ * @import { GraphicsDevice } from '../../platform/graphics/graphics-device.js'
+ * @import { GraphNode } from '../graph-node.js'
+ * @import { GSplatResource } from '../gsplat/gsplat-resource.js'
+ * @import { GSplatResourceBase } from '../gsplat/gsplat-resource-base.js'
+ * @import { GSplatOctreeResource } from './gsplat-octree.resource.js'
+ * @import { ScopeId } from '../../platform/graphics/scope-id.js'
+ * @import { Texture } from '../../platform/graphics/texture.js'
+ * @import { Vec2 } from '../../core/math/vec2.js'
+ */
+
+/**
+ * Class representing a placement of a gsplat resource.
+ *
+ * @ignore
+ */
+class GSplatPlacement {
+    /**
+     * The resource of the splat..
+     *
+     * @type {GSplatResource|GSplatOctreeResource|null}
+     */
+    resource;
+
+    /**
+     * The node that the gsplat is linked to.
+     *
+     * @type {GraphNode}
+     */
+    node;
+
+    /**
+     * Map of intervals for octree nodes using this placement.
+     * Key is octree node index, value is Vec2 representing start and end index (inclusive).
+     *
+     * @type {Map<number, Vec2>}
+     */
+    intervals = new Map();
+
+    /**
+     * Unique identifier for this placement. Used by the picking system and available
+     * for custom shader effects.
+     */
+    id = 0;
+
+    /**
+     * Unique allocation identifier for persistent work buffer allocation tracking.
+     *
+     * @type {number}
+     */
+    allocId = GsplatAllocId.get();
+
+    /**
+     * The LOD index for this placement.
+     */
+    lodIndex = 0;
+
+    /**
+     * Minimum allowed LOD index (inclusive). Clamped to the asset's valid range at use.
+     *
+     * @private
+     */
+    _lodRangeMin = 0;
+
+    /**
+     * Maximum allowed LOD index (inclusive). Clamped to the asset's valid range at use.
+     *
+     * @private
+     */
+    _lodRangeMax = 99;
+
+    /**
+     * Distance of the first LOD transition, from LOD 0 to LOD 1, in world units.
+     *
+     * @private
+     */
+    _lodBaseDistance = 5;
+
+    /**
+     * Factor between successive LOD transition distances.
+     *
+     * @private
+     */
+    _lodMultiplier = 3;
+
+    /**
+     * @type {number}
+     */
+    set lodBaseDistance(value) {
+        if (this._lodBaseDistance !== value) {
+            this._lodBaseDistance = value;
+            this.lodDirty = true;
+        }
+    }
+
+    get lodBaseDistance() {
+        return this._lodBaseDistance;
+    }
+
+    /**
+     * @type {number}
+     */
+    set lodMultiplier(value) {
+        if (this._lodMultiplier !== value) {
+            this._lodMultiplier = value;
+            this.lodDirty = true;
+        }
+    }
+
+    get lodMultiplier() {
+        return this._lodMultiplier;
+    }
+
+    /**
+     * @type {number}
+     */
+    set lodRangeMin(value) {
+        if (this._lodRangeMin !== value) {
+            this._lodRangeMin = value;
+            this.lodDirty = true;
+        }
+    }
+
+    get lodRangeMin() {
+        return this._lodRangeMin;
+    }
+
+    /**
+     * @type {number}
+     */
+    set lodRangeMax(value) {
+        if (this._lodRangeMax !== value) {
+            this._lodRangeMax = value;
+            this.lodDirty = true;
+        }
+    }
+
+    get lodRangeMax() {
+        return this._lodRangeMax;
+    }
+
+    /**
+     * The axis-aligned bounding box for this placement, in local space.
+     * Null means use resource.aabb as fallback.
+     *
+     * @type {BoundingBox|null}
+     */
+    _aabb = null;
+
+    /**
+     * Per-instance shader parameters. Reference to the component's parameters Map.
+     *
+     * @type {Map<string, {scopeId: ScopeId, data: *}>|null}
+     */
+    parameters = null;
+
+    /**
+     * Optional streams for instance-level textures.
+     *
+     * @type {GSplatStreams|null}
+     * @private
+     */
+    _streams = null;
+
+    /**
+     * Flag indicating LOD parameters have changed and LOD needs re-evaluation.
+     */
+    lodDirty = false;
+
+    /**
+     * Monotonically increasing counter, bumped whenever this placement's splats need to be
+     * re-copied to the work buffer (parameter or modifier changes, or an explicit one-shot update
+     * request). Each consumer (a per-camera {@link GSplatInfo}) remembers the value it last
+     * copied at, so a single request re-copies every consumer of a shared placement exactly once,
+     * and child placements (octree files, environment) fan out from their parent's counter.
+     *
+     * @type {number}
+     * @ignore
+     */
+    dirtyVersion = 0;
+
+    /**
+     * Work buffer update mode (see WORKBUFFER_UPDATE_*). WORKBUFFER_UPDATE_ONCE is not stored as a
+     * mode - it is converted into a single {@link dirtyVersion} bump.
+     *
+     * @type {number}
+     * @private
+     */
+    _workBufferUpdate = WORKBUFFER_UPDATE_AUTO;
+
+    /**
+     * Custom work buffer modifier code for this placement (object with code and pre-computed hash).
+     *
+     * @type {{ code: string, hash: number }|null}
+     * @private
+     */
+    _workBufferModifier = null;
+
+    /**
+     * Parent placement. Used by octree file placements to inherit workBufferModifier and
+     * parameters from the component's placement.
+     *
+     * @type {GSplatPlacement|null}
+     * @ignore
+     */
+    parentPlacement = null;
+
+    /**
+     * Create a new GSplatPlacement.
+     *
+     * @param {GSplatResource|null} resource - The resource of the splat.
+     * @param {GraphNode} node - The node that the gsplat is linked to.
+     * @param {number} [lodIndex] - The LOD index for this placement.
+     * @param {Map<string, {scopeId: ScopeId, data: *}>|null} [parameters] - Per-instance shader parameters.
+     * @param {GSplatPlacement|null} [parentPlacement] - Parent placement for shader config delegation.
+     * @param {number|null} [id] - Unique identifier for picking. If not provided, inherits from parentPlacement.
+     */
+    constructor(resource, node, lodIndex = 0, parameters = null, parentPlacement = null, id = null) {
+        this.id = id ?? parentPlacement?.id ?? 0;
+        this.resource = resource;
+        this.node = node;
+        this.lodIndex = lodIndex;
+        this.parameters = parameters ?? parentPlacement?.parameters ?? null;
+        this.parentPlacement = parentPlacement;
+    }
+
+    /**
+     * Destroys this placement and releases all resources.
+     */
+    destroy() {
+        this._streams?.destroy();
+        this._streams = null;
+        this.intervals.clear();
+        this.resource = null;
+    }
+
+    /**
+     * Sets the work buffer modifier for this placement. Triggers work buffer re-render.
+     * Must provide all three functions: modifySplatCenter, modifySplatRotationScale, modifySplatColor.
+     *
+     * @type {{ code: string, hash: number }|null}
+     */
+    set workBufferModifier(value) {
+        this._workBufferModifier = value;
+        this.dirtyVersion++;
+    }
+
+    /**
+     * Gets the work buffer modifier for this placement.
+     * Delegates to parent placement if available (for octree file placements).
+     *
+     * @type {{ code: string, hash: number }|null}
+     */
+    get workBufferModifier() {
+        return this.parentPlacement?.workBufferModifier ?? this._workBufferModifier;
+    }
+
+    /**
+     * Sets the work buffer update mode (see WORKBUFFER_UPDATE_*). WORKBUFFER_UPDATE_ONCE is turned
+     * into a single {@link dirtyVersion} bump so every consumer re-copies once, rather than being
+     * stored as a persistent mode.
+     *
+     * @type {number}
+     */
+    set workBufferUpdate(value) {
+        if (value === WORKBUFFER_UPDATE_ONCE) {
+            this.dirtyVersion++;
+        } else {
+            this._workBufferUpdate = value;
+        }
+    }
+
+    /**
+     * Gets the work buffer update mode.
+     *
+     * @type {number}
+     */
+    get workBufferUpdate() {
+        return this._workBufferUpdate;
+    }
+
+    /**
+     * Marks the placement as needing a one-time re-copy to the work buffer by all of its
+     * consumers.
+     */
+    markDirty() {
+        this.dirtyVersion++;
+    }
+
+    /**
+     * Sets a custom AABB for this placement. Pass null to use resource.aabb as fallback.
+     *
+     * @param {BoundingBox|null} aabb - The bounding box to set, or null to clear.
+     */
+    set aabb(aabb) {
+        this._aabb = aabb?.clone() ?? null;
+    }
+
+    /**
+     * Gets the AABB for this placement. Returns custom AABB if set, otherwise resource.aabb.
+     *
+     * @returns {BoundingBox} The bounding box.
+     */
+    get aabb() {
+        const aabb = this._aabb ?? this.resource?.aabb;
+        Debug.assert(aabb, 'GSplatPlacement.aabb is null - resource.aabb must be set');
+        return /** @type {BoundingBox} */ (aabb);
+    }
+
+    /**
+     * Gets an instance-level texture by name. Creates the streams container on first access
+     * if the format has instance streams defined.
+     *
+     * @param {string} name - The name of the texture to get.
+     * @param {GraphicsDevice} device - The graphics device (required for lazy initialization).
+     * @returns {Texture|undefined} The texture, or undefined if not found.
+     */
+    getInstanceTexture(name, device) {
+        // Cast to access GSplatResourceBase properties (GSplatOctreeResource doesn't have format/streams)
+        const resource = /** @type {GSplatResourceBase} */ (this.resource);
+        if (!resource?.format) {
+            return undefined;
+        }
+
+        // Lazy-initialize streams if format has instance streams
+        if (!this._streams && resource.format.instanceStreams.length > 0) {
+            this._streams = new GSplatStreams(device, true);
+            this._streams.textureDimensions.copy(resource.streams.textureDimensions);
+            this._streams.syncWithFormat(resource.format);
+        }
+
+        return this._streams?.getTexture(name);
+    }
+
+    /**
+     * Gets the instance streams container, or null if not initialized.
+     * Delegates to parent placement if available (for octree file placements).
+     *
+     * @type {GSplatStreams|null}
+     * @ignore
+     */
+    get streams() {
+        return this.parentPlacement?.streams ?? this._streams;
+    }
+
+    /**
+     * Ensures instance streams container exists if format has instance streams.
+     *
+     * @param {GraphicsDevice} device - The graphics device.
+     * @ignore
+     */
+    ensureInstanceStreams(device) {
+        const resource = /** @type {GSplatResourceBase} */ (this.resource);
+        if (!resource?.format) {
+            return;
+        }
+
+        if (!this._streams && resource.format.instanceStreams.length > 0) {
+            this._streams = new GSplatStreams(device, true);
+            this._streams.textureDimensions.copy(resource.streams.textureDimensions);
+            this._streams.syncWithFormat(resource.format);
+        }
+    }
+}
+
+
+export { GSplatPlacement };

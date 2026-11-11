@@ -1,0 +1,73 @@
+{
+  "name": "examples-browser",
+  "version": "0.0.0",
+  "description": "Examples browser for the PlayCanvas Engine",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "build": "cross-env NODE_ENV=production node build.mjs",
+    "build:metadata": "node build.mjs --metadata",
+    "build:thumbnails": "node build.mjs --thumbnails",
+    "check:thumbnails": "node build.mjs --check-thumbnails",
+    "cert": "node build.mjs --cert",
+    "clean": "node build.mjs --clean",
+    "dev": "npm run -s build:metadata && cross-env NODE_ENV=development vite",
+    "dev:https": "npm run -s build:metadata && cross-env NODE_ENV=development EXAMPLES_HTTPS=1 vite",
+    "develop": "npm run -s build:metadata && cross-env NODE_ENV=development EXAMPLES_AUTO_RELOAD=false vite",
+    "develop:https": "npm run -s build:metadata && cross-env NODE_ENV=development EXAMPLES_AUTO_RELOAD=false EXAMPLES_HTTPS=1 vite",
+    "fmt": "prettier --check \"src/examples/**/*.{mjs,jsx}\"",
+    "fmt:fix": "prettier --write \"src/examples/**/*.{mjs,jsx}\"",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "serve": "vite preview",
+    "typecheck": "npm run -s typecheck:app && npm run -s typecheck:examples",
+    "typecheck:app": "npm run -s build:metadata && tsc -p tsconfig.app.json --pretty false",
+    "typecheck:examples": "node utils/typecheck-examples.mjs"
+  },
+  "devDependencies": {
+    "@babel/standalone": "8.0.5",
+    "@monaco-editor/react": "4.7.0",
+    "@playcanvas/eslint-config": "3.0.0",
+    "@playcanvas/inspector": "0.5.0",
+    "@playcanvas/observer": "1.7.1",
+    "@playcanvas/pcui": "6.1.4",
+    "@tweenjs/tween.js": "25.0.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/react-router-dom": "5.3.3",
+    "3d-tiles-renderer": "0.5.4",
+    "cross-env": "10.1.0",
+    "esbuild": "0.28.2",
+    "eslint": "9.39.5",
+    "eslint-config-prettier": "10.1.8",
+    "examples": "file:./iframe",
+    "fflate": "0.8.3",
+    "fs-extra": "11.4.0",
+    "monaco-editor": "0.55.1",
+    "playcanvas": "file:..",
+    "prettier": "3.9.7",
+    "prop-types": "15.8.1",
+    "puppeteer": "25.11.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-router-dom": "7.18.4",
+    "sharp": "0.35.5",
+    "typescript": "5.9.3",
+    "vite": "8.3.3"
+  },
+  "overrides": {
+    "@playcanvas/inspector": {
+      "playcanvas": "$playcanvas"
+    },
+    "3d-tiles-renderer": {
+      "playcanvas": "$playcanvas"
+    }
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "puppeteer": true,
+    "unrs-resolver": true
+  },
+  "author": "PlayCanvas <support@playcanvas.com>",
+  "license": "MIT"
+}

@@ -1,0 +1,132 @@
+import { UniformBufferFormat, UniformFormat } from '../uniform-buffer-format.js';
+import { BlendState } from '../blend-state.js';
+import {
+    PRIMITIVE_TRISTRIP, SHADERLANGUAGE_WGSL,
+    UNIFORMTYPE_FLOAT, UNIFORMTYPE_VEC4, BINDGROUP_MESH, CLEARFLAG_COLOR, CLEARFLAG_DEPTH, CLEARFLAG_STENCIL,
+    BINDGROUP_MESH_UB, BINDGROUP_MATERIAL, CULLFACE_NONE, FRONTFACE_CCW, FUNC_ALWAYS, STENCILOP_REPLACE
+} from '../constants.js';
+import { Shader } from '../shader.js';
+import { DynamicBindGroup } from '../bind-group.js';
+import { UniformBuffer } from '../uniform-buffer.js';
+import { DebugGraphics } from '../debug-graphics.js';
+import { DepthState } from '../depth-state.js';
+import { StencilParameters } from '../stencil-parameters.js';
+import webgpuClear from '../shader-chunks/frag/webgpu-clear.js';
+
+const primitive = {
+    type: PRIMITIVE_TRISTRIP,
+    base: 0,
+    baseVertex: 0,
+    count: 4,
+    indexed: false
+};
+
+/**
+ * A WebGPU helper class implementing a viewport clear operation. When rendering to a texture,
+ * the whole surface can be cleared using loadOp, but if only a viewport needs to be cleared, or if
+ * it needs to be cleared later during the rendering, this need to be achieved by rendering a quad.
+ * This class renders a full-screen quad, and expects the viewport / scissor to be set up to clip
+ * it to only required area.
+ *
+ * @ignore
+ */
+class WebgpuClearRenderer {
+    constructor(device) {
+
+        // shader that can write out color and depth values
+        this.shader = new Shader(device, {
+            name: 'WebGPUClearRendererShader',
+            shaderLanguage: SHADERLANGUAGE_WGSL,
+            vshader: webgpuClear,
+            fshader: webgpuClear
+        });
+
+        // uniforms
+        this.uniformBuffer = new UniformBuffer(device, new UniformBufferFormat(device, [
+            new UniformFormat('color', UNIFORMTYPE_VEC4),
+            new UniformFormat('depth', UNIFORMTYPE_FLOAT)
+        ]), false);
+
+        this.dynamicBindGroup = new DynamicBindGroup();
+
+        // uniform data
+        this.colorData = new Float32Array(4);
+
+        // stencil state replacing the stencil value with the reference value, which is set to the
+        // clear value
+        this.stencilState = new StencilParameters({
+            func: FUNC_ALWAYS,
+            zpass: STENCILOP_REPLACE
+        });
+    }
+
+    destroy() {
+        this.shader.destroy();
+        this.shader = null;
+
+        this.uniformBuffer.destroy();
+        this.uniformBuffer = null;
+    }
+
+    clear(device, renderTarget, options, defaultOptions) {
+        options = options || defaultOptions;
+
+        const flags = options.flags ?? defaultOptions.flags;
+        if (flags !== 0) {
+
+            DebugGraphics.pushGpuMarker(device, 'CLEAR-RENDERER');
+
+            // dynamic bind group for the UB
+            const { uniformBuffer, dynamicBindGroup } = this;
+            uniformBuffer.startUpdate(dynamicBindGroup);
+            device.setBindGroup(BINDGROUP_MESH_UB, dynamicBindGroup.bindGroup, dynamicBindGroup.offsets);
+
+            // not using mesh bind group
+            device.setBindGroup(BINDGROUP_MESH, device.emptyBindGroup);
+
+            // not using material bind group
+            device.setBindGroup(BINDGROUP_MATERIAL, device.emptyBindGroup);
+
+            // setup clear color
+            let blendState;
+            if ((flags & CLEARFLAG_COLOR) && (renderTarget.colorBuffer || renderTarget.impl.assignedColorTexture)) {
+                const color = options.color ?? defaultOptions.color;
+                this.colorData.set(color);
+                blendState = BlendState.NOBLEND;
+            } else {
+                blendState = BlendState.NOWRITE;
+            }
+            uniformBuffer.set('color', this.colorData);
+
+            // setup depth clear
+            let depthState;
+            if ((flags & CLEARFLAG_DEPTH) && renderTarget.depth) {
+                const depth = options.depth ?? defaultOptions.depth;
+                uniformBuffer.set('depth', depth);
+                depthState = DepthState.WRITEDEPTH;
+            } else {
+                uniformBuffer.set('depth', 1);
+                depthState = DepthState.NODEPTH;
+            }
+
+            // setup stencil clear
+            let stencilState = null;
+            if ((flags & CLEARFLAG_STENCIL) && renderTarget.stencil) {
+                stencilState = this.stencilState;
+                stencilState.ref = options.stencil ?? defaultOptions.stencil;
+            }
+
+            uniformBuffer.endUpdate();
+
+            device.setDrawStates(blendState, depthState, CULLFACE_NONE, FRONTFACE_CCW, stencilState, stencilState);
+
+            // render 4 vertices without vertex buffer
+            device.setShader(this.shader);
+            device.draw(primitive);
+
+            DebugGraphics.popGpuMarker(device);
+        }
+    }
+}
+
+export { WebgpuClearRenderer };

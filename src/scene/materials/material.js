@@ -1,0 +1,1671 @@
+import { Debug } from '../../core/debug.js';
+import {
+    BLENDMODE_ZERO, BLENDMODE_ONE, BLENDMODE_SRC_COLOR,
+    BLENDMODE_DST_COLOR, BLENDMODE_ONE_MINUS_DST_COLOR, BLENDMODE_SRC_ALPHA,
+    BLENDMODE_ONE_MINUS_SRC_ALPHA,
+    BLENDEQUATION_ADD, BLENDEQUATION_REVERSE_SUBTRACT,
+    BLENDEQUATION_MIN, BLENDEQUATION_MAX,
+    CULLFACE_BACK,
+    SHADERLANGUAGE_GLSL,
+    FRONTFACE_CCW
+} from '../../platform/graphics/constants.js';
+import { BlendState } from '../../platform/graphics/blend-state.js';
+import { DepthState } from '../../platform/graphics/depth-state.js';
+import { BindGroup } from '../../platform/graphics/bind-group.js';
+import { UniformBuffer } from '../../platform/graphics/uniform-buffer.js';
+import { getMaterialLayout } from './material-uniform-buffer-layout.js';
+import {
+    getUnappliedMaterialProperties, initMaterialDebug, recordMaterialChange, warnUnappliedMaterialProperties
+} from './material-debug.js';
+import {
+    BLEND_ADDITIVE, BLEND_NORMAL, BLEND_NONE, BLEND_PREMULTIPLIED,
+    BLEND_MULTIPLICATIVE, BLEND_ADDITIVEALPHA, BLEND_MULTIPLICATIVE2X, BLEND_SCREEN,
+    BLEND_MIN, BLEND_MAX, BLEND_SUBTRACTIVE
+} from '../constants.js';
+import { getDefaultMaterial } from './default-material.js';
+import { ShaderChunks } from '../shader-lib/shader-chunks.js';
+import { isViewTexture } from '../renderer/view-textures.js';
+
+/**
+ * @import { GraphicsDevice } from '../../platform/graphics/graphics-device.js'
+ * @import { MaterialTextureDescriptor } from './standard-material-textures.js'
+ * @import { MaterialUniformBufferLayout } from './material-uniform-buffer-layout.js'
+ * @import { ScopeId } from '../../platform/graphics/scope-id.js'
+ * @import { MaterialProperty } from './material-property.js'
+ * @import { Light } from '../light.js';
+ * @import { LightList } from '../lighting/light-list.js';
+ * @import { MeshInstance } from '../mesh-instance.js'
+ * @import { CameraShaderParams } from '../camera-shader-params.js'
+ * @import { Scene } from '../scene.js'
+ * @import { Shader } from '../../platform/graphics/shader.js'
+ * @import { StencilParameters } from '../../platform/graphics/stencil-parameters.js'
+ * @import { Texture } from '../../platform/graphics/texture.js'
+ * @import { TextureView } from '../../platform/graphics/texture-view.js'
+ * @import { UniformBufferFormat } from '../../platform/graphics/uniform-buffer-format.js';
+ * @import { VertexFormat } from '../../platform/graphics/vertex-format.js';
+ * @import { ShaderChunkMap } from '../shader-lib/shader-chunk-map.js';
+ * @import { StorageBuffer } from '../../platform/graphics/storage-buffer.js';
+ */
+
+// blend mode mapping to op, srcBlend and dstBlend
+const blendModes = [];
+blendModes[BLEND_SUBTRACTIVE] = { src: BLENDMODE_ONE, dst: BLENDMODE_ONE, op: BLENDEQUATION_REVERSE_SUBTRACT };
+blendModes[BLEND_NONE] = { src: BLENDMODE_ONE, dst: BLENDMODE_ZERO, op: BLENDEQUATION_ADD };
+blendModes[BLEND_NORMAL] = { src: BLENDMODE_SRC_ALPHA, dst: BLENDMODE_ONE_MINUS_SRC_ALPHA, op: BLENDEQUATION_ADD, alphaSrc: BLENDMODE_ONE };
+blendModes[BLEND_PREMULTIPLIED] = { src: BLENDMODE_ONE, dst: BLENDMODE_ONE_MINUS_SRC_ALPHA, op: BLENDEQUATION_ADD };
+blendModes[BLEND_ADDITIVE] = { src: BLENDMODE_ONE, dst: BLENDMODE_ONE, op: BLENDEQUATION_ADD };
+blendModes[BLEND_ADDITIVEALPHA] = { src: BLENDMODE_SRC_ALPHA, dst: BLENDMODE_ONE, op: BLENDEQUATION_ADD };
+blendModes[BLEND_MULTIPLICATIVE2X] = { src: BLENDMODE_DST_COLOR, dst: BLENDMODE_SRC_COLOR, op: BLENDEQUATION_ADD };
+blendModes[BLEND_SCREEN] = { src: BLENDMODE_ONE_MINUS_DST_COLOR, dst: BLENDMODE_ONE, op: BLENDEQUATION_ADD };
+blendModes[BLEND_MULTIPLICATIVE] = { src: BLENDMODE_DST_COLOR, dst: BLENDMODE_ZERO, op: BLENDEQUATION_ADD };
+blendModes[BLEND_MIN] = { src: BLENDMODE_ONE, dst: BLENDMODE_ONE, op: BLENDEQUATION_MIN };
+blendModes[BLEND_MAX] = { src: BLENDMODE_ONE, dst: BLENDMODE_ONE, op: BLENDEQUATION_MAX };
+
+let id = 0;
+
+/**
+ * @typedef {object} ShaderVariantParams - The description of the parameters used by the
+ * Material#getShaderVariant function.
+ * @property {GraphicsDevice} device - The graphics device.
+ * @property {Scene} scene - The scene.
+ * @property {number} objDefs - The object definitions.
+ * @property {CameraShaderParams} cameraShaderParams - The camera shader parameters.
+ * @property {number} pass - The shader pass.
+ * @property {LightList} lightList - The lights of the pass.
+ * @property {UniformBufferFormat|null} [viewUniformFormat] - The view uniform format.
+ * @property {VertexFormat} vertexFormat - The vertex format.
+ * @ignore
+ */
+
+/**
+ * A material determines how a particular {@link MeshInstance} is rendered, and specifies
+ * render state including uniforms, textures, defines, and other properties.
+ *
+ * This is a base class and cannot be instantiated and used directly. Only subclasses such
+ * as {@link ShaderMaterial} and {@link StandardMaterial} can be used to define materials
+ * for rendering.
+ *
+ * Choose {@link StandardMaterial} for a physically based surface described by properties and
+ * textures, and {@link ShaderMaterial} to supply your own vertex and fragment shaders. Both share
+ * the state defined here: blending through {@link blendType}, depth behavior through
+ * {@link depthTest}, {@link depthWrite} and {@link depthFunc}, face culling through {@link cull},
+ * alpha testing through {@link alphaTest}, shader uniforms through {@link setParameter}, and
+ * preprocessor defines through {@link setDefine}. {@link getShaderChunks} exposes the GLSL and WGSL
+ * chunks the material's shader is built from, so one chunk can be replaced without writing a whole
+ * shader.
+ *
+ * After changing properties, call {@link update} so the change reaches the GPU. Most changes only
+ * refresh uniforms; a change that alters how the shader is generated also clears the material's
+ * compiled shader variants, which are rebuilt on demand. A material can be shared by any number of
+ * mesh instances, and {@link clone} makes an independent copy.
+ *
+ * @example
+ * // Make a material additive and double-sided, then apply the change
+ * material.blendType = BLEND_ADDITIVE;
+ * material.cull = CULLFACE_NONE;
+ * material.update();
+ * @category Graphics
+ */
+class Material {
+    /**
+     * The mesh instances referencing this material
+     *
+     * @type {Set<MeshInstance>}
+     * @private
+     */
+    meshInstances = new Set();
+
+    /**
+     * The name of the material.
+     */
+    name = 'Untitled';
+
+    /**
+     * A unique id the user can assign to the material. The engine internally does not use this for
+     * anything, and the user can assign a value to this id for any purpose they like. Defaults to
+     * an empty string.
+     */
+    userId = '';
+
+    id = id++;
+
+    /**
+     * The cache of shader variants generated for this material. The key represents the unique
+     * variant, the value is the shader.
+     *
+     * @type {Map<number, Shader>}
+     * @ignore
+     */
+    variants = new Map();
+
+    /**
+     * The set of defines used to generate the shader variants. Mutate this only via
+     * {@link Material#setDefine} (or {@link Material#copy}); direct mutation bypasses the cached
+     * {@link Material#definesKey}.
+     *
+     * @type {Map<string, string|number|boolean>}
+     * @ignore
+     */
+    defines = new Map();
+
+    _definesDirty = false;
+
+    /**
+     * Cached content key for {@link Material#defines}, or null when it needs recomputing. An empty
+     * defines set caches as '', so null unambiguously means "dirty".
+     *
+     * @type {string|null}
+     * @private
+     */
+    _definesKey = null;
+
+    parameters = {};
+
+    /**
+     * @type {number}
+     * @private
+     */
+    _alphaTest = 0;
+
+    /**
+     * Enables or disables alpha to coverage. When enabled, and if hardware anti-aliasing is on,
+     * limited order-independent transparency can be achieved. Quality depends on the number of
+     * MSAA samples of the current render target. It can nicely soften edges of otherwise sharp
+     * alpha cutouts, but isn't recommended for large area semi-transparent surfaces. Note, that
+     * you don't need to enable blending to make alpha to coverage work. It will work without it,
+     * just like alphaTest.
+     *
+     * This requires a multi-sampled render target, and is silently ignored when rendering to a
+     * single-sampled one. On WebGPU it additionally requires the first color attachment of the
+     * render target to use a blendable format with an alpha channel, and is silently ignored
+     * otherwise - note that {@link PIXELFORMAT_RG11B10F}, the default HDR format used by
+     * {@link CameraFrame}, has no alpha channel.
+     */
+    alphaToCoverage = false;
+
+    /** @ignore */
+    _blendState = new BlendState();
+
+    /**
+     * Explicit setting of sceneTexturesWrite, or undefined to derive it from transparency.
+     *
+     * @type {boolean|undefined}
+     * @private
+     */
+    _sceneTexturesWrite;
+
+    /** @ignore */
+    _depthState = new DepthState();
+
+    /**
+     * Controls how triangles are culled based on their face direction with respect to the
+     * viewpoint. Can be:
+     *
+     * - {@link CULLFACE_NONE}: Do not cull triangles based on face direction.
+     * - {@link CULLFACE_BACK}: Cull the back faces of triangles (do not render triangles facing
+     * away from the view point).
+     * - {@link CULLFACE_FRONT}: Cull the front faces of triangles (do not render triangles facing
+     * towards the view point).
+     *
+     * Defaults to {@link CULLFACE_BACK}.
+     *
+     * @type {number}
+     */
+    cull = CULLFACE_BACK;
+
+    /**
+     * Controls whether polygons are front- or back-facing by setting a winding
+     * orientation. Can be:
+     *
+     * - {@link FRONTFACE_CW}: The clock-wise winding.
+     * - {@link FRONTFACE_CCW}: The counterclockwise winding.
+     *
+     * Defaults to {@link FRONTFACE_CCW}.
+     *
+     * @type {number}
+     */
+    frontFace = FRONTFACE_CCW;
+
+    /**
+     * Stencil parameters for front faces (default is null).
+     *
+     * @type {StencilParameters|null}
+     */
+    stencilFront = null;
+
+    /**
+     * Stencil parameters for back faces (default is null).
+     *
+     * @type {StencilParameters|null}
+     */
+    stencilBack = null;
+
+    /**
+     * @type {ShaderChunks|null}
+     * @private
+     */
+    _shaderChunks = null;
+
+    // this is deprecated, keeping for backwards compatibility
+    _oldChunks = {};
+
+    _dirtyShader = true;
+
+    /**
+     * True for a material whose shaders are built from the engine shader chunks, in which the names
+     * of the textures the renderer supplies per pass are reserved. On WebGPU those shaders read the
+     * textures from the view bind group, see getViewTextures, so a value set per material or per
+     * mesh instance is ignored. Other materials, such as a {@link ShaderMaterial} running a user's
+     * shader, keep all their textures in the mesh bind group.
+     *
+     * @type {boolean}
+     * @ignore
+     */
+    _usesViewTextures = false;
+
+    /** @protected */
+    constructor() {
+        if (new.target === Material) {
+            Debug.error('Material class cannot be instantiated, use ShaderMaterial instead');
+        }
+
+        // debug state (creation site, last change site, warning flag) exists in debug builds only
+        Debug.call(() => initMaterialDebug(this));
+    }
+
+    /**
+     * Enables or disables flat shading. When enabled, the surface is shaded using the geometric
+     * normal of the triangle the fragment belongs to, instead of the normal interpolated from the
+     * vertex normals, giving the mesh a faceted look. This works on skinned and morphed geometry as
+     * well.
+     *
+     * The geometric normal is oriented to match the winding of the triangle, as configured by
+     * {@link Material#frontFace}, and so it agrees with correctly authored vertex normals. Flat
+     * shading therefore only changes the faceting - {@link Material#cull},
+     * {@link Material#frontFace} and {@link StandardMaterial#twoSidedLighting} all behave the same
+     * as they do for smooth shading.
+     *
+     * {@link StandardMaterial} and `LitMaterial` implement this automatically. For a
+     * {@link ShaderMaterial}, this adds a `FLAT_SHADING` define to the shader, which the supplied
+     * shader code needs to handle. The `flatNormalPS` chunk provides the `getFlatNormal` function
+     * used by the engine internally, and can be used for this:
+     *
+     * ```javascript
+     * #include "flatNormalPS"
+     * ...
+     * #ifdef FLAT_SHADING
+     *     vec3 normal = getFlatNormal(worldPos);
+     * #else
+     *     vec3 normal = normalize(interpolatedNormal);
+     * #endif
+     * ```
+     *
+     * As with other material properties, call {@link Material#update} after changing this.
+     *
+     * Defaults to false.
+     *
+     * @type {boolean}
+     */
+    set flatShading(value) {
+        this.setDefine('FLAT_SHADING', value);
+    }
+
+    /**
+     * Gets whether flat shading is enabled.
+     *
+     * @type {boolean}
+     */
+    get flatShading() {
+        return this.defines.has('FLAT_SHADING');
+    }
+
+    /**
+     * Returns true if the material has custom shader chunks.
+     *
+     * @type {boolean}
+     * @ignore
+     */
+    get hasShaderChunks() {
+        return this._shaderChunks != null;
+    }
+
+    /**
+     * Returns the shader chunks for the material. Those get allocated if they are not already.
+     *
+     * @type {ShaderChunks}
+     * @ignore
+     */
+    get shaderChunks() {
+        if (!this._shaderChunks) {
+            this._shaderChunks = new ShaderChunks();
+        }
+        return this._shaderChunks;
+    }
+
+    /**
+     * Returns an object containing shader chunks for a specific shader language for the material.
+     * These chunks define custom GLSL or WGSL code used to construct the final shader for the
+     * material. The chunks can be also be included in shaders using the `#include "ChunkName"`
+     * directive.
+     *
+     * On the WebGL platform:
+     *  - If GLSL chunks are provided, they are used directly.
+     *
+     * On the WebGPU platform:
+     * - If WGSL chunks are provided, they are used directly.
+     * - If only GLSL chunks are provided, a GLSL shader is generated and then transpiled to WGSL,
+     * which is less efficient.
+     *
+     * To ensure faster shader compilation, it is recommended to provide shader chunks for all
+     * supported platforms.
+     *
+     * A simple example on how to override a shader chunk providing emissive color for both GLSL and
+     * WGSL to simply return a red color:
+     *
+     * ```javascript
+     * material.getShaderChunks(SHADERLANGUAGE_GLSL).set('emissivePS', `
+     *     void getEmission() {
+     *         dEmission = vec3(1.0, 0.0, 1.0);
+     *     }
+     * `);
+     *
+     * material.getShaderChunks(SHADERLANGUAGE_WGSL).set('emissivePS', `
+     *     fn getEmission() {
+     *         dEmission = vec3f(1.0, 0.0, 1.0);
+     *     }
+     * `);
+     *
+     * // call update to apply the changes
+     * material.update();
+     * ```
+     *
+     * @param {string} [shaderLanguage] - Specifies the shader language of shaders. Defaults to
+     * {@link SHADERLANGUAGE_GLSL}.
+     * @returns {ShaderChunkMap} - The shader chunks for the specified shader language.
+     */
+    getShaderChunks(shaderLanguage = SHADERLANGUAGE_GLSL) {
+        const chunks = this.shaderChunks;
+        return shaderLanguage === SHADERLANGUAGE_GLSL ? chunks.glsl : chunks.wgsl;
+    }
+
+    /**
+     * Sets the version of the shader chunks.
+     *
+     * This should be a string containing the current engine major and minor version (e.g., '2.8'
+     * for engine v2.8.1) and ensures compatibility with the current engine version. When providing
+     * custom shader chunks, set this to the latest supported version. If a future engine release no
+     * longer supports the specified version, a warning will be issued. In that case, update your
+     * shader chunks to match the new format and set this to the latest version accordingly.
+     *
+     * @type {string}
+     */
+    set shaderChunksVersion(value) {
+        this.shaderChunks.version = value;
+    }
+
+    /**
+     * Returns the version of the shader chunks.
+     *
+     * @type {string}
+     */
+    get shaderChunksVersion() {
+        return this.shaderChunks.version;
+    }
+
+    /**
+     * @deprecated Use Material.getShaderChunks instead. For example:
+     * material.getShaderChunks(SHADERLANGUAGE_GLSL).set("chunkName", "chunkCode")
+     * @type {Object<string, string>}
+     * @ignore
+     */
+    set chunks(value) {
+        Debug.deprecated('Material.chunks has been removed, please use Material.getShaderChunks instead. For example: material.getShaderChunks(SHADERLANGUAGE_GLSL).set("chunkName", "chunkCode")');
+        this._oldChunks = value;
+    }
+
+    /**
+     * @deprecated Use Material.getShaderChunks instead. For example:
+     * material.getShaderChunks(SHADERLANGUAGE_GLSL).set("chunkName", "chunkCode")
+     * @type {Object<string, string>}
+     * @ignore
+     */
+    get chunks() {
+        Debug.deprecated('Material.chunks has been removed, please use Material.getShaderChunks instead. For example: material.getShaderChunks(SHADERLANGUAGE_GLSL).set("chunkName", "chunkCode")');
+        Object.assign(this._oldChunks, Object.fromEntries(this.shaderChunks.glsl));
+        return this._oldChunks;
+    }
+
+    /**
+     * Sets the alpha test reference value to control which fragments are written to the currently
+     * active render target based on alpha value. All fragments with an alpha value of less than
+     * the alphaTest reference value will be discarded. Defaults to 0 (all fragments pass).
+     *
+     * @type {number}
+     */
+    set alphaTest(value) {
+        this._alphaTest = value;
+    }
+
+    /**
+     * Gets the alpha test reference value.
+     *
+     * @type {number}
+     */
+    get alphaTest() {
+        return this._alphaTest;
+    }
+
+    /**
+     * Sets the offset for the output depth buffer value. Useful for decals to prevent z-fighting.
+     * Typically a small negative value (-0.1) is used to render the mesh slightly closer to the
+     * camera.
+     *
+     * @type {number}
+     */
+    set depthBias(value) {
+        this._depthState.depthBias = value;
+    }
+
+    /**
+     * Gets the offset for the output depth buffer value.
+     *
+     * @type {number}
+     */
+    get depthBias() {
+        return this._depthState.depthBias;
+    }
+
+    /**
+     * Sets the offset for the output depth buffer value based on the slope of the triangle
+     * relative to the camera.
+     *
+     * @type {number}
+     */
+    set slopeDepthBias(value) {
+        this._depthState.depthBiasSlope = value;
+    }
+
+    /**
+     * Gets the offset for the output depth buffer value based on the slope of the triangle
+     * relative to the camera.
+     *
+     * @type {number}
+     */
+    get slopeDepthBias() {
+        return this._depthState.depthBiasSlope;
+    }
+
+    _shaderVersion = 0;
+
+    _scene = null;
+
+    /**
+     * Incremented by {@link Material#update} so internal consumers can detect material changes
+     * without consuming shared dirty state.
+     *
+     * @type {number}
+     * @private
+     */
+    _updateVersion = 0;
+
+    /**
+     * The update version most recently processed by {@link Material#prepareForRender}.
+     *
+     * @type {number}
+     * @private
+     */
+    _preparedVersion = -1;
+
+    /**
+     * Typed properties whose public value changed and has not been written to the uniform buffer
+     * yet. Allocated on first use.
+     *
+     * @type {Set<MaterialProperty>|null}
+     * @private
+     */
+    _modifiedProperties = null;
+
+    /**
+     * Snapshots of the aggregate typed property values handed out by a getter, by property.
+     * Compared on update to detect in-place mutation of the returned object. Allocated on first
+     * use.
+     *
+     * @type {Map<MaterialProperty, object>|null}
+     * @private
+     */
+    _mutableProperties = null;
+
+    /**
+     * The uniform buffer storing the typed properties, created on the first preparation for
+     * rendering. Null for materials without typed properties.
+     *
+     * @type {UniformBuffer|null}
+     * @private
+     */
+    _uniformBuffer = null;
+
+    /**
+     * The bind group holding the material uniform buffer.
+     *
+     * @type {BindGroup|null}
+     * @private
+     */
+    _uniformBufferBindGroup = null;
+
+    /**
+     * The layout the uniform buffer and the bind group were built from, null until the first
+     * render of the material.
+     *
+     * @type {MaterialUniformBufferLayout|null}
+     * @private
+     */
+    _layout = null;
+
+    /**
+     * Incremented when a texture of the material is assigned. A material whose textures decide the
+     * slots of its bind group moves this, as assigning one can change those slots without changing
+     * any of its typed properties.
+     *
+     * @type {number}
+     * @ignore
+     */
+    _textureAssignmentVersion = 0;
+
+    /**
+     * The texture assignment version the layout was last resolved for.
+     *
+     * @type {number}
+     * @private
+     */
+    _resolvedTextureVersion = -1;
+
+    /**
+     * Incremented each time typed property data is written to the uniform buffer storage.
+     *
+     * @type {number}
+     * @private
+     */
+    _uniformDataVersion = 0;
+
+    /**
+     * The uniform data version most recently uploaded to the GPU.
+     *
+     * @type {number}
+     * @private
+     */
+    _uniformUploadedVersion = -1;
+
+    /**
+     * The version incremented each time {@link Material#update} is called.
+     *
+     * @type {number}
+     * @ignore
+     */
+    get updateVersion() {
+        return this._updateVersion;
+    }
+
+    /**
+     * The typed properties of the material, stored in its uniform buffer, or null for a material
+     * without typed properties.
+     *
+     * @type {MaterialProperty[]|null}
+     * @ignore
+     */
+    get propertyDescriptors() {
+        return null;
+    }
+
+    /**
+     * Returns the typed property whose uniform, stored in the material uniform buffer, has the given
+     * name, or null when no typed property uses it. A mesh instance parameter of that name
+     * overrides the uniform through a copy of the buffer rather than through the scope.
+     *
+     * @param {string} name - The name of the uniform.
+     * @returns {MaterialProperty|null} The property, or null.
+     * @ignore
+     */
+    getUniformBufferProperty(name) {
+        return null;
+    }
+
+    /**
+     * The textures of the material, one per slot of its bind group. Empty for a material which
+     * keeps its textures on the scope instead.
+     *
+     * @type {MaterialTextureDescriptor[]}
+     * @ignore
+     */
+    get textureDescriptors() {
+        return [];
+    }
+
+    /**
+     * The textures the material holds in its own bind group on this device. Only a device using
+     * bind groups has one to hold them; without it they stay on the scope, which is also where a
+     * mesh instance overriding one of them has to apply it.
+     *
+     * @param {GraphicsDevice} device - The graphics device.
+     * @returns {MaterialTextureDescriptor[]} The textures.
+     * @ignore
+     */
+    getTextureDescriptors(device) {
+        return device.usesMeshBindGroups ? this.textureDescriptors : [];
+    }
+
+    /**
+     * The index of the texture slot of the material's bind group a name refers to, or -1 when the
+     * name is not one of them. A mesh instance parameter of such a name overrides that texture of
+     * the material for its own draws, applied through the copy of the bind group the mesh instance
+     * keeps rather than through the scope.
+     *
+     * @param {string} name - The name of the texture.
+     * @returns {number} The index of the texture slot, or -1.
+     * @ignore
+     */
+    getTextureSlot(name) {
+        return this._uniformBufferBindGroup?.format.textureFormatsMap.get(name) ?? -1;
+    }
+
+    /**
+     * Incremented when the layout of the material is replaced - the set of its typed properties or
+     * of its textures changed - so that mesh instances re-classify their parameters against it.
+     * Constant for a material whose layout never changes.
+     *
+     * @type {number}
+     * @private
+     */
+    _layoutVersion = 0;
+
+    /**
+     * True when the set of uniforms of the material uniform buffer changed since the buffer was
+     * created, so the layout is fetched again on the next preparation.
+     *
+     * @type {boolean}
+     * @private
+     */
+    _layoutDirty = false;
+
+    /**
+     * The version of the layout of the material: its typed properties, see
+     * {@link Material#getUniformBufferProperty}, and its textures, see
+     * {@link Material#getTextureSlot}.
+     *
+     * @type {number}
+     * @ignore
+     */
+    get layoutVersion() {
+        return this._layoutVersion;
+    }
+
+    /**
+     * Marks the layout of the material as changed: the next preparation fetches it again, and
+     * replaces the uniform buffer and the bind group when it differs.
+     *
+     * @protected
+     */
+    _markLayoutDirty() {
+        this._layoutDirty = true;
+    }
+
+    /**
+     * The bind group holding the material uniform buffer, or null until the material has been
+     * prepared for rendering, or when it has no typed properties.
+     *
+     * @type {BindGroup|null}
+     * @ignore
+     */
+    get uniformBufferBindGroup() {
+        return this._uniformBufferBindGroup;
+    }
+
+    /**
+     * The uniform buffer storing the typed properties, or null until the material has been
+     * prepared for rendering, or when it has no typed properties.
+     *
+     * @type {UniformBuffer|null}
+     * @ignore
+     */
+    get uniformBuffer() {
+        return this._uniformBuffer;
+    }
+
+    /**
+     * Incremented each time typed property data is written to the uniform buffer storage, so that
+     * copies of the buffer (mesh instance overrides) can detect a change.
+     *
+     * @type {number}
+     * @ignore
+     */
+    get uniformDataVersion() {
+        return this._uniformDataVersion;
+    }
+
+    /** @ignore */
+    get dirty() {
+        Debug.removed('Material#dirty has been removed. Call Material#update() after modifying material properties.');
+        return undefined;
+    }
+
+    /**
+     * Sets whether the red channel is written to the color buffer. If true, the red component of
+     * fragments generated by the shader of this material is written to the color buffer of the
+     * currently active render target. If false, the red component will not be written. Defaults to
+     * true.
+     *
+     * @type {boolean}
+     */
+    set redWrite(value) {
+        this._blendState.redWrite = value;
+    }
+
+    /**
+     * Gets whether the red channel is written to the color buffer.
+     *
+     * @type {boolean}
+     */
+    get redWrite() {
+        return this._blendState.redWrite;
+    }
+
+    /**
+     * Sets whether the green channel is written to the color buffer. If true, the red component of
+     * fragments generated by the shader of this material is written to the color buffer of the
+     * currently active render target. If false, the green component will not be written. Defaults
+     * to true.
+     *
+     * @type {boolean}
+     */
+    set greenWrite(value) {
+        this._blendState.greenWrite = value;
+    }
+
+    /**
+     * Gets whether the green channel is written to the color buffer.
+     *
+     * @type {boolean}
+     */
+    get greenWrite() {
+        return this._blendState.greenWrite;
+    }
+
+    /**
+     * Sets whether the blue channel is written to the color buffer. If true, the red component of
+     * fragments generated by the shader of this material is written to the color buffer of the
+     * currently active render target. If false, the blue component will not be written. Defaults
+     * to true.
+     *
+     * @type {boolean}
+     */
+    set blueWrite(value) {
+        this._blendState.blueWrite = value;
+    }
+
+    /**
+     * Gets whether the blue channel is written to the color buffer.
+     *
+     * @type {boolean}
+     */
+    get blueWrite() {
+        return this._blendState.blueWrite;
+    }
+
+    /**
+     * Sets whether the alpha channel is written to the color buffer. If true, the red component of
+     * fragments generated by the shader of this material is written to the color buffer of the
+     * currently active render target. If false, the alpha component will not be written. Defaults
+     * to true.
+     *
+     * @type {boolean}
+     */
+    set alphaWrite(value) {
+        this._blendState.alphaWrite = value;
+    }
+
+    /**
+     * Gets whether the alpha channel is written to the color buffer.
+     *
+     * @type {boolean}
+     */
+    get alphaWrite() {
+        return this._blendState.alphaWrite;
+    }
+
+    // returns boolean depending on material being transparent
+    get transparent() {
+        return this._blendState.blend;
+    }
+
+    /**
+     * Declares whether this material's shader generates the scene textures - the additional render
+     * target attachments the scene pass renders alongside the scene color, holding per pixel data
+     * such as the linear depth. It applies to all of them at once, as a shader either supports the
+     * scene textures or it does not. The attachments of a material that does not generate them are
+     * masked off, as a shader leaving an attachment unwritten makes the draw invalid.
+     *
+     * The default depends on where the shader comes from, so this rarely needs setting:
+     *
+     * - {@link StandardMaterial} and `LitMaterial` generate them from the engine's own shader,
+     * so they default to true when opaque and false when transparent - blending the values of
+     * ordinary transparent geometry into them is not meaningful.
+     * - {@link ShaderMaterial} defaults to false, as its shader is supplied by the user. Set this to
+     * true if that shader outputs them using the `sceneTexturesPS` chunk.
+     * - Gaussian splat materials set it to true, the deliberate exception to the transparency rule -
+     * their premultiplied blending accumulates a transmittance weighted average.
+     * - Particle materials set it to false, as they use their own shader.
+     *
+     * Unlike {@link Material#depthWrite} and the color write properties this is not purely a mask:
+     * setting it to true for a shader that does not generate the scene textures makes its draws
+     * invalid, rather than simply skipping the write.
+     *
+     * @type {boolean}
+     * @ignore
+     */
+    set sceneTexturesWrite(value) {
+        this._sceneTexturesWrite = value;
+    }
+
+    /**
+     * Gets whether this material's shader generates the scene textures. Returns the explicitly set
+     * value when there is one, and otherwise derives it from transparency - opaque materials generate
+     * them, transparent ones do not. See the setter for the default of each material type.
+     *
+     * @type {boolean}
+     * @ignore
+     */
+    get sceneTexturesWrite() {
+        return this._sceneTexturesWrite ?? !this.transparent;
+    }
+
+    _updateTransparency() {
+        for (const meshInstance of this.meshInstances) {
+            meshInstance.transparent = this.transparent;
+        }
+    }
+
+    /**
+     * Sets the blend state for this material. Controls how fragment shader outputs are blended
+     * when being written to the currently active render target. This overwrites blending type set
+     * using {@link blendType}, and offers more control over blending.
+     *
+     * @type {BlendState}
+     */
+    set blendState(value) {
+        const wasDualSource = this._blendState.usesDualSourceBlending;
+        this._blendState.copy(value);
+        this._updateTransparency();
+
+        if (wasDualSource !== this._blendState.usesDualSourceBlending) {
+            this.clearVariants();
+        }
+    }
+
+    /**
+     * Gets the blend state for this material. Use the setter to update transparency and sort state.
+     *
+     * @type {Readonly<BlendState>}
+     */
+    get blendState() {
+        return this._blendState;
+    }
+
+    /**
+     * Sets the blend mode for this material. Controls how fragment shader outputs are blended when
+     * being written to the currently active render target. Can be:
+     *
+     * - {@link BLEND_SUBTRACTIVE}: Subtract the color of the source fragment from the destination
+     * fragment and write the result to the frame buffer.
+     * - {@link BLEND_ADDITIVE}: Add the color of the source fragment to the destination fragment
+     * and write the result to the frame buffer.
+     * - {@link BLEND_NORMAL}: Enable simple translucency for materials such as glass. This is
+     * equivalent to enabling a source blend mode of {@link BLENDMODE_SRC_ALPHA} and a destination
+     * blend mode of {@link BLENDMODE_ONE_MINUS_SRC_ALPHA}.
+     * - {@link BLEND_NONE}: Disable blending.
+     * - {@link BLEND_PREMULTIPLIED}: Similar to {@link BLEND_NORMAL} expect the source fragment is
+     * assumed to have already been multiplied by the source alpha value.
+     * - {@link BLEND_MULTIPLICATIVE}: Multiply the color of the source fragment by the color of the
+     * destination fragment and write the result to the frame buffer.
+     * - {@link BLEND_ADDITIVEALPHA}: Same as {@link BLEND_ADDITIVE} except the source RGB is
+     * multiplied by the source alpha.
+     * - {@link BLEND_MULTIPLICATIVE2X}: Multiplies colors and doubles the result.
+     * - {@link BLEND_SCREEN}: Softer version of additive.
+     * - {@link BLEND_MIN}: Minimum color.
+     * - {@link BLEND_MAX}: Maximum color.
+     *
+     * Defaults to {@link BLEND_NONE}.
+     *
+     * @type {number}
+     */
+    set blendType(type) {
+
+        const wasDualSource = this._blendState.usesDualSourceBlending;
+        const blendMode = blendModes[type];
+        Debug.assert(blendMode, `Unknown blend mode ${type}`);
+        this._blendState.setColorBlend(blendMode.op, blendMode.src, blendMode.dst);
+        this._blendState.setAlphaBlend(blendMode.alphaOp ?? blendMode.op, blendMode.alphaSrc ?? blendMode.src, blendMode.alphaDst ?? blendMode.dst);
+
+        const blend = type !== BLEND_NONE;
+        if (this._blendState.blend !== blend) {
+            this._blendState.blend = blend;
+            this._updateTransparency();
+        }
+        this._updateMeshInstanceKeys();
+
+        if (wasDualSource !== this._blendState.usesDualSourceBlending) {
+            this.clearVariants();
+        }
+    }
+
+    /**
+     * Gets the blend mode for this material.
+     *
+     * @type {number}
+     */
+    get blendType() {
+        if (!this.transparent) {
+            return BLEND_NONE;
+        }
+
+        const { colorOp, colorSrcFactor, colorDstFactor, alphaOp, alphaSrcFactor, alphaDstFactor } = this._blendState;
+
+        for (let i = 0; i < blendModes.length; i++) {
+            const blendMode = blendModes[i];
+            if (blendMode.src === colorSrcFactor && blendMode.dst === colorDstFactor && blendMode.op === colorOp &&
+                blendMode.src === alphaSrcFactor && blendMode.dst === alphaDstFactor && blendMode.op === alphaOp) {
+                return i;
+            }
+        }
+
+        return BLEND_NORMAL;
+    }
+
+    /**
+     * Sets the depth state. Note that this can also be done by using {@link depthTest},
+     * {@link depthFunc} and {@link depthWrite}.
+     *
+     * @type {DepthState}
+     */
+    set depthState(value) {
+        this._depthState.copy(value);
+    }
+
+    /**
+     * Gets the depth state.
+     *
+     * @type {DepthState}
+     */
+    get depthState() {
+        return this._depthState;
+    }
+
+    /**
+     * Sets whether depth testing is enabled. If true, fragments generated by the shader of this
+     * material are only written to the current render target if they pass the depth test. If
+     * false, fragments generated by the shader of this material are written to the current render
+     * target regardless of what is in the depth buffer. See {@link DepthState#test} for how this
+     * interacts with {@link depthFunc}. Depth writes are controlled independently by
+     * {@link depthWrite}. Defaults to true.
+     *
+     * @type {boolean}
+     */
+    set depthTest(value) {
+        this._depthState.test = value;
+    }
+
+    /**
+     * Gets whether depth testing is enabled.
+     *
+     * @type {boolean}
+     */
+    get depthTest() {
+        return this._depthState.test;
+    }
+
+    /**
+     * Sets the depth test function. Controls how the depth of new fragments is compared against
+     * the current depth contained in the depth buffer. Can be:
+     *
+     * - {@link FUNC_NEVER}: don't draw
+     * - {@link FUNC_LESS}: draw if new depth < depth buffer
+     * - {@link FUNC_EQUAL}: draw if new depth == depth buffer
+     * - {@link FUNC_LESSEQUAL}: draw if new depth <= depth buffer
+     * - {@link FUNC_GREATER}: draw if new depth > depth buffer
+     * - {@link FUNC_NOTEQUAL}: draw if new depth != depth buffer
+     * - {@link FUNC_GREATEREQUAL}: draw if new depth >= depth buffer
+     * - {@link FUNC_ALWAYS}: always draw
+     *
+     * Defaults to {@link FUNC_LESSEQUAL}.
+     *
+     * @type {number}
+     */
+    set depthFunc(value) {
+        this._depthState.func = value;
+    }
+
+    /**
+     * Gets the depth test function.
+     *
+     * @type {number}
+     */
+    get depthFunc() {
+        return this._depthState.func;
+    }
+
+    /**
+     * Sets whether depth writing is enabled. If true, fragments generated by the shader of this
+     * material write a depth value to the depth buffer of the currently active render target. If
+     * false, no depth value is written. Defaults to true.
+     *
+     * @type {boolean}
+     */
+    set depthWrite(value) {
+        this._depthState.write = value;
+    }
+
+    /**
+     * Gets whether depth writing is enabled.
+     *
+     * @type {boolean}
+     */
+    get depthWrite() {
+        return this._depthState.write;
+    }
+
+    /**
+     * Copy a material.
+     *
+     * @param {Material} source - The material to copy.
+     * @returns {Material} The destination material.
+     */
+    copy(source) {
+        this.name = source.name;
+
+        // Render states
+        this.alphaTest = source.alphaTest;
+        this.alphaToCoverage = source.alphaToCoverage;
+
+        this._blendState.copy(source._blendState);
+        this._depthState.copy(source._depthState);
+        this._sceneTexturesWrite = source._sceneTexturesWrite;
+
+        this.cull = source.cull;
+        this.frontFace = source.frontFace;
+
+        this.stencilFront = source.stencilFront?.clone();
+        if (source.stencilBack) {
+            this.stencilBack = source.stencilFront === source.stencilBack ? this.stencilFront : source.stencilBack.clone();
+        }
+
+        // Shader parameters
+        this.clearParameters();
+        for (const name in source.parameters) {
+            if (source.parameters.hasOwnProperty(name)) {
+                this._setParameterSimple(name, source.parameters[name].data);
+            }
+        }
+
+        // defines
+        this.defines.clear();
+        source.defines.forEach((value, key) => this.defines.set(key, value));
+        this._definesKey = null;
+
+        // shader chunks
+        this._shaderChunks = source.hasShaderChunks ? new ShaderChunks() : null;
+        this._shaderChunks?.copy(source._shaderChunks);
+
+        return this;
+    }
+
+    /**
+     * Clone a material.
+     *
+     * @returns {this} A newly cloned material.
+     */
+    clone() {
+        const clone = new this.constructor();
+        return clone.copy(this);
+    }
+
+    _updateMeshInstanceKeys() {
+        for (const meshInstance of this.meshInstances) {
+            meshInstance.updateKey();
+        }
+    }
+
+    /** @private */
+    _clearVariantsIfDirty() {
+        if (this._dirtyShader) {
+            this.clearVariants();
+            this._dirtyShader = false;
+        }
+    }
+
+    updateUniforms(device, scene) {
+        // Compatibility fallback for materials rendered without calling update().
+        this._clearVariantsIfDirty();
+    }
+
+    /**
+     * Records that the public value of a typed property changed. The value is written to the
+     * uniform buffer by the next {@link Material#update}.
+     *
+     * @param {MaterialProperty} property - The property.
+     * @protected
+     */
+    _markPropertyModified(property) {
+        this._modifiedProperties ??= new Set();
+        this._modifiedProperties.add(property);
+        Debug.call(() => recordMaterialChange(this));
+    }
+
+    /**
+     * Records that the aggregate value of a typed property was handed out by its getter, so that
+     * an in-place mutation of the returned object can be detected by the next
+     * {@link Material#update}. Only the first exposure allocates a snapshot.
+     *
+     * @param {MaterialProperty} property - The property.
+     * @param {object} value - The value returned by the getter, with clone, equals and copy.
+     * @protected
+     */
+    _markPropertyMutable(property, value) {
+        this._mutableProperties ??= new Map();
+        if (!this._mutableProperties.has(property)) {
+            this._mutableProperties.set(property, value.clone());
+        }
+        Debug.call(() => recordMaterialChange(this));
+    }
+
+    /**
+     * Processes the typed property changes: in-place mutations of exposed values are detected and
+     * treated as modifications, and modified values are converted into the uniform buffer storage.
+     * Until the uniform buffer exists, the modified properties stay pending and are written when it
+     * is created. Runs from {@link Material#update} - the renderer does not process changes, so a
+     * change made without a subsequent update is not applied (and reported in the debug build).
+     *
+     * @private
+     */
+    _updateProperties() {
+        const mutable = this._mutableProperties;
+        if (mutable) {
+            for (const [property, snapshot] of mutable) {
+                const value = this[property.backingName];
+                if (!snapshot.equals(value)) {
+                    snapshot.copy(value);
+                    this._markPropertyModified(property);
+                }
+            }
+        }
+
+        const modified = this._modifiedProperties;
+        const uniformBuffer = this._uniformBuffer;
+        if (modified?.size && uniformBuffer) {
+            const storage = uniformBuffer.storageFloat32;
+            const format = uniformBuffer.format;
+            for (const property of modified) {
+                // a uniform not in the buffer yet is written when the next preparation moves the values
+                // to the buffer of the changed layout, which writes every property
+                const uniform = format.get(property.uniformName);
+                if (uniform) {
+                    property.convert(this[property.backingName], storage, uniform.offset, this);
+                }
+            }
+            modified.clear();
+            this._uniformDataVersion++;
+        }
+    }
+
+    /**
+     * Creates the material uniform buffer and its bind group on first use, and uploads the
+     * uniform buffer when its data changed.
+     *
+     * @param {GraphicsDevice} device - The graphics device.
+     * @private
+     */
+    _prepareUniformBuffer(device) {
+        const properties = this.propertyDescriptors;
+        if (!properties) {
+            return;
+        }
+
+        // a texture was assigned since the layout was resolved, so which of the material's maps
+        // claim a sampler, and so the texture slots of its bind group, may have changed
+        if (this._resolvedTextureVersion !== this._textureAssignmentVersion) {
+            this._resolvedTextureVersion = this._textureAssignmentVersion;
+            this._layoutDirty = true;
+        }
+
+        let uniformBuffer = this._uniformBuffer;
+        if (!uniformBuffer || this._layoutDirty) {
+            this._layoutDirty = false;
+            const layout = getMaterialLayout(device, properties, this.getTextureDescriptors(device));
+            this._layout = layout;
+
+            // a different set of texture slots is a different shader, and a shader built against
+            // the previous set would be drawn with a bind group which no longer matches it
+            const slotsChanged = !!this._uniformBufferBindGroup &&
+                this._uniformBufferBindGroup.format !== layout.bindGroupFormat;
+
+            if (uniformBuffer?.format !== layout.uniformBufferFormat ||
+                this._uniformBufferBindGroup?.format !== layout.bindGroupFormat) {
+
+                // the values move to a buffer of the new layout
+                this._uniformBufferBindGroup?.destroy();
+                uniformBuffer?.destroy();
+
+                uniformBuffer = new UniformBuffer(device, layout.uniformBufferFormat, true);
+                this._uniformBuffer = uniformBuffer;
+                this._uniformBufferBindGroup = new BindGroup(device, layout.bindGroupFormat, uniformBuffer);
+
+                // mesh instances classify their parameters against the properties and the
+                // resources of this layout, including on the first render of the material, which
+                // is after they were given it
+                this._layoutVersion++;
+
+                // every property is written into the new storage
+                this._modifiedProperties ??= new Set();
+                for (const property of properties) {
+                    this._modifiedProperties.add(property);
+                }
+                this._updateProperties();
+                this._uniformUploadedVersion = -1;
+
+                // the shaders built against the previous set of texture slots cannot be drawn with
+                // this bind group, and a change of the slots alone does not dirty them
+                if (slotsChanged) {
+                    this.clearVariants();
+                }
+            }
+        }
+
+        Debug.assert(uniformBuffer.device === device, 'A material can only be rendered by the graphics device that created its uniform buffer.', this);
+
+        if (this._uniformUploadedVersion !== this._uniformDataVersion) {
+            uniformBuffer.upload();
+            this._uniformUploadedVersion = this._uniformDataVersion;
+        }
+
+        // the textures of the bind group, in the order of its slots. Assigning a texture compares
+        // a reference, so this is cheaper than tracking a version for it, and the group is only
+        // rebuilt when one of them changed
+        const textures = this._layout.textures;
+        for (let i = 0; i < textures.length; i++) {
+            this._uniformBufferBindGroup.setTextureAt(i, this[textures[i].mapName] ?? device.builtInTextures.white);
+        }
+
+        // the material assigns the resources of its bind group itself, so the scope takes no part
+        // in it. The group is (re)built when dirty: on creation, which needs the uploaded buffer,
+        // and after a lost context
+        this._uniformBufferBindGroup.commit();
+    }
+
+    /**
+     * Prepares the material for rendering when it has been updated since the previous preparation.
+     * Typed property changes are applied by {@link Material#update} only; the debug build reports
+     * changes that were made without a subsequent update, as they are not applied.
+     *
+     * @param {GraphicsDevice} device - The graphics device.
+     * @param {Scene} scene - The scene.
+     * @ignore
+     */
+    prepareForRender(device, scene) {
+        const version = this._updateVersion;
+        if (this._preparedVersion !== version) {
+            this.updateUniforms(device, scene);
+            this._preparedVersion = version;
+        }
+
+        this._prepareUniformBuffer(device);
+
+        Debug.call(() => {
+            // detect once per update cycle: after the warning, nothing is checked until the next update
+            if (!this._debugWarnedUnapplied) {
+                const names = getUnappliedMaterialProperties(this);
+                if (names.length > 0) {
+                    this._debugWarnedUnapplied = true;
+                    warnUnappliedMaterialProperties(this, names);
+                }
+            }
+        });
+    }
+
+    /**
+     * @param {ShaderVariantParams} params - The parameters used to generate the shader variant.
+     * @ignore
+     */
+    getShaderVariant(params) {
+        Debug.assert(false, 'Not implemented');
+    }
+
+    /**
+     * Applies any changes made to the material's properties. This method should be called after
+     * modifying material properties to ensure the changes take effect.
+     *
+     * The method will clear cached shader variants and trigger recompilation if:
+     * - Modified material properties require a different shader variant (e.g., enabling/disabling
+     *   textures or other properties that affect shader generation)
+     * - Material-specific shader chunks (from {@link getShaderChunks}) have been modified
+     * - Global shader chunks (from {@link ShaderChunks.get}) have been modified
+     * - Material defines have been changed
+     *
+     * Note: Shaders are not compiled immediately. Instead, existing shader variants are cleared
+     * and new variants will be compiled on-demand as they are needed for different render passes
+     * (e.g., forward, shadow, pick).
+     *
+     * When global shader chunks are modified, `update()` must be called on each material that
+     * should reflect those changes.
+     */
+    update() {
+
+        // handle deprecated chunks for backwards compatibility
+        if (Object.keys(this._oldChunks).length > 0) {
+            for (const [key, value] of Object.entries(this._oldChunks)) {
+                this.shaderChunks.glsl.set(key, value);
+                delete this._oldChunks[key];
+            }
+        }
+
+        // if the defines or chunks were modified, we need to rebuild the shaders
+        if (this._definesDirty || this._shaderChunks?.isDirty()) {
+            this._definesDirty = false;
+            this._shaderChunks?.resetDirty();
+            this._dirtyShader = true;
+        }
+
+        this._clearVariantsIfDirty();
+        this._updateProperties();
+        this._updateVersion++;
+
+        Debug.call(() => {
+            this._debugWarnedUnapplied = false;
+        });
+    }
+
+    // Parameter management
+    clearParameters() {
+        this.parameters = {};
+    }
+
+    getParameters() {
+        return this.parameters;
+    }
+
+    clearVariants() {
+        // clear variants on the material
+        this.variants.clear();
+
+        // but also clear them from all materials that reference them
+        for (const meshInstance of this.meshInstances) {
+            meshInstance.clearShaders();
+        }
+    }
+
+    /**
+     * Retrieves the specified shader parameter from a material.
+     *
+     * @param {string} name - The name of the parameter to query.
+     * @returns {object} The named parameter.
+     */
+    getParameter(name) {
+        return this.parameters[name];
+    }
+
+    _setParameterSimple(name, data) {
+
+        Debug.call(() => {
+            if (data === undefined) {
+                Debug.warnOnce(`Material#setParameter: Attempting to set undefined data for parameter "${name}", this is likely not expected.`, this);
+            }
+        });
+
+        const param = this.parameters[name];
+        if (param) {
+            param.data = data;
+        } else {
+            this.parameters[name] = {
+                scopeId: null,
+                data: data
+            };
+        }
+    }
+
+    /**
+     * Sets a shader parameter on a material.
+     *
+     * @param {string} name - The name of the parameter to set.
+     * @param {number|number[]|ArrayBufferView|Texture|TextureView|StorageBuffer} data - The value for the
+     * specified parameter. A {@link TextureView} is only supported on WebGPU, see
+     * {@link Texture#getView}.
+     */
+    setParameter(name, data) {
+
+        if (data === undefined && typeof name === 'object') {
+            const uniformObject = name;
+            if (uniformObject.length) {
+                for (let i = 0; i < uniformObject.length; i++) {
+                    this.setParameter(uniformObject[i]);
+                }
+                return;
+            }
+            name = uniformObject.name;
+            data = uniformObject.value;
+        }
+
+        Debug.call(() => {
+            if (this.getUniformBufferProperty(name)) {
+                Debug.warnOnce(`Material#setParameter: '${name}' is the uniform of a typed material property, stored in the material uniform buffer, and is ignored as a parameter. Set the material property instead.`, this);
+            }
+            if (this._usesViewTextures && isViewTexture(name)) {
+                Debug.warnOnce(`Material#setParameter: '${name}' is a texture the renderer supplies once per pass, and a value set per material is ignored on WebGPU.`, this);
+            }
+        });
+
+        this._setParameterSimple(name, data);
+    }
+
+    /**
+     * Deletes a shader parameter on a material.
+     *
+     * @param {string} name - The name of the parameter to delete.
+     */
+    deleteParameter(name) {
+        if (this.parameters[name]) {
+            delete this.parameters[name];
+        }
+    }
+
+    /**
+     * Applies the parameters of this material to the scope. Called internally by the renderer at
+     * a material switch, and again after a draw whose mesh instance overrode some of them on the
+     * scope, to restore the material values for the next draw.
+     *
+     * @param {GraphicsDevice} device - The graphics device.
+     * @param {{name: string}[]} [restore] - When specified, only the parameters with the names of
+     * these entries are applied (the scope parameters of a mesh instance), otherwise all are.
+     * @ignore
+     */
+    setParameters(device, restore) {
+        const parameters = this.parameters;
+        if (restore) {
+            for (let i = 0; i < restore.length; i++) {
+                const parameter = parameters[restore[i].name];
+                if (parameter) {
+                    this._setScopeParameter(device, parameter, restore[i].name);
+                }
+            }
+        } else {
+            for (const paramName in parameters) {
+                this._setScopeParameter(device, parameters[paramName], paramName);
+            }
+        }
+    }
+
+    /**
+     * @param {GraphicsDevice} device - The graphics device.
+     * @param {{scopeId: ScopeId|null, data: any}} parameter - The parameter.
+     * @param {string} name - The name of the parameter.
+     * @private
+     */
+    _setScopeParameter(device, parameter, name) {
+        if (!parameter.scopeId) {
+            parameter.scopeId = device.scope.resolve(name);
+        }
+        parameter.scopeId.setValue(parameter.data);
+    }
+
+    /**
+     * Adds or removes a define on the material. Defines can be used to enable or disable various
+     * parts of the shader code.
+     *
+     * @param {string} name - The name of the define to set.
+     * @param {string|number|boolean|undefined} value - The value of the define. If undefined or
+     * false, the define is removed.
+     *
+     * A simple example on how to set a custom shader define value used by the shader processor.
+     *
+     * ```javascript
+     * material.setDefine('MY_DEFINE', true);
+     *
+     * // call update to apply the changes, which will recompile the shader using the new define
+     * material.update();
+     * ```
+     */
+    setDefine(name, value) {
+        let modified = false;
+        const { defines } = this;
+
+        if (value !== undefined && value !== false) {
+            modified = !defines.has(name) || defines.get(name) !== value;
+            defines.set(name, value);
+        } else {
+            modified = defines.has(name);
+            defines.delete(name);
+        }
+
+        this._definesDirty ||= modified;
+        if (modified) {
+            this._definesKey = null;
+        }
+    }
+
+    /**
+     * A cached content key for the material defines, rebuilt lazily only when the defines change.
+     * Useful to cheaply detect define changes without scanning the map every frame.
+     *
+     * @type {string}
+     * @ignore
+     */
+    get definesKey() {
+        if (this._definesKey === null) {
+            this._definesKey = Array.from(this.defines)
+            .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+            .map(([k, v]) => `${k}=${v}`)
+            .join(',');
+        }
+        return this._definesKey;
+    }
+
+    /**
+     * Returns true if a define is enabled on the material, otherwise false.
+     *
+     * @param {string} name - The name of the define to check.
+     * @returns {boolean} The value of the define.
+     */
+    getDefine(name) {
+        return this.defines.has(name);
+    }
+
+    /**
+     * Removes this material from the scene and possibly frees up memory from its shaders (if there
+     * are no other materials using it).
+     */
+    destroy() {
+        this.variants.clear();
+
+        this._uniformBufferBindGroup?.destroy();
+        this._uniformBufferBindGroup = null;
+        this._uniformBuffer?.destroy();
+        this._uniformBuffer = null;
+
+        for (const meshInstance of this.meshInstances) {
+            meshInstance.clearShaders();
+            meshInstance._material = null;
+
+            if (meshInstance.mesh) {
+                const defaultMaterial = getDefaultMaterial(meshInstance.mesh.device);
+                if (this !== defaultMaterial) {
+                    meshInstance.material = defaultMaterial;
+                }
+            } else {
+                Debug.warn('Material: MeshInstance.mesh is null, default material cannot be assigned to the MeshInstance');
+            }
+        }
+
+        this.meshInstances.clear();
+    }
+
+    /**
+     * Registers mesh instance as referencing the material.
+     *
+     * @param {MeshInstance} meshInstance - The mesh instance to register.
+     * @ignore
+     */
+    addMeshInstanceRef(meshInstance) {
+        this.meshInstances.add(meshInstance);
+    }
+
+    /**
+     * De-registers mesh instance as referencing the material.
+     *
+     * @param {MeshInstance} meshInstance - The mesh instance to de-register.
+     * @ignore
+     */
+    removeMeshInstanceRef(meshInstance) {
+        this.meshInstances.delete(meshInstance);
+    }
+
+    /**
+     * Sets the material's shader. Not supported.
+     *
+     * @ignore
+     * @deprecated Use {@link ShaderMaterial} instead.
+     */
+    set shader(value) {
+        Debug.removed('Material#shader was removed. Use ShaderMaterial instead.');
+    }
+
+    /**
+     * Gets the material's shader. Always returns null.
+     *
+     * @ignore
+     * @deprecated Use {@link ShaderMaterial} instead.
+     */
+    get shader() {
+        Debug.removed('Material#shader was removed. Use ShaderMaterial instead.');
+        return null;
+    }
+
+    /**
+     * Sets whether blending is enabled. Note: this is used by the Editor.
+     *
+     * @type {boolean}
+     * @ignore
+     * @deprecated Use {@link Material#blendState} instead.
+     */
+    set blend(value) {
+        Debug.deprecated('Material#blend is deprecated, use Material.blendState.');
+        this.blendState.blend = value;
+    }
+
+    /**
+     * Gets whether blending is enabled.
+     *
+     * @type {boolean}
+     * @ignore
+     * @deprecated Use {@link Material#blendState} instead.
+     */
+    get blend() {
+        return this.blendState.blend;
+    }
+}
+
+export { Material };

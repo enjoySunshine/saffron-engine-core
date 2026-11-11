@@ -1,0 +1,115 @@
+/**
+ * Extras is a collection of supplementary APIs designed to extend the capabilities of the
+ * PlayCanvas Engine. They cover features such as gizmos, file export, runtime performance
+ * profiling and advanced post-processing effects.
+ */
+
+export { MiniStats } from './mini-stats/mini-stats.js';
+
+// RENDERERS
+export { OutlineRenderer } from './renderers/outline-renderer.js';
+export { TextureRenderer } from './renderers/texture-renderer.js';
+export {
+    LINECAP_BUTT,
+    LINECAP_ROUND,
+    LINECAP_SQUARE,
+    LINEJOIN_BEVEL,
+    LINEJOIN_MITER,
+    LINEJOIN_ROUND,
+    WideLine
+} from './renderers/wide-line.js';
+export { LINEWIDTH_SCREEN, LINEWIDTH_WORLD, WideLineRenderer } from './renderers/wide-line-renderer.js';
+export { WireRenderer } from './renderers/wire-renderer.js';
+
+// GRID
+export { Grid } from './grid/grid.js';
+
+// VOXELS
+export * from './voxel/voxel-occupancy.js';
+
+// EXPORTERS
+export { UsdzExporter } from './exporters/usdz-exporter.js';
+export { GltfExporter } from './exporters/gltf-exporter.js';
+
+// RENDER PASSES
+export { SSAOTYPE_NONE, SSAOTYPE_LIGHTING, SSAOTYPE_COMBINE } from './render-passes/constants.js';
+export { CLOUDTYPE_NONE, CLOUDTYPE_FLAT, CLOUDTYPE_VOLUMETRIC } from './render-passes/constants.js';
+export { COMPOSESLOT_SCENE, COMPOSESLOT_HDR, COMPOSESLOT_LDR, COMPOSESLOT_OUTPUT } from './render-passes/constants.js';
+export {
+    FRAMERESOURCE_DEPTH, FRAMERESOURCE_PREPASSDEPTH, FRAMERESOURCE_SCENECOLORHALF, FRAMERESOURCE_SCENECOLORGRAB,
+    FRAMERESOURCE_SCENETARGET
+} from './render-passes/constants.js';
+export { CameraFrame } from './render-passes/camera-frame.js';
+// export * rather than the class alone, so the effect's typedefs reach the type declarations
+export * from './render-passes/camera-frame-effect.js';
+export { FramePassCameraFrame, CameraFrameOptions } from './render-passes/frame-pass-camera-frame.js';
+export { RenderPassCompose } from './render-passes/render-pass-compose.js';
+export { RenderPassDownsample } from './render-passes/render-pass-downsample.js';
+export { RenderPassPrepass } from './render-passes/render-pass-prepass.js';
+export { RenderPassUpsample } from './render-passes/render-pass-upsample.js';
+
+// EFFECTS
+export { AutoExposureEffect } from './effects/auto-exposure/auto-exposure-effect.js';
+export { BloomEffect } from './effects/bloom/bloom-effect.js';
+export { CasEffect } from './effects/cas/cas-effect.js';
+export { ColorEnhanceEffect } from './effects/color-enhance/color-enhance-effect.js';
+export { ColorLutEffect } from './effects/color-lut/color-lut-effect.js';
+export { DofEffect } from './effects/dof/dof-effect.js';
+export { DynamicSkyEffect } from './effects/dynamic-sky/dynamic-sky-effect.js';
+export { FringingEffect } from './effects/fringing/fringing-effect.js';
+export { GradingEffect } from './effects/grading/grading-effect.js';
+export { LensFlare } from './effects/lens-flare/lens-flare.js';
+export { LensFlareEffect } from './effects/lens-flare/lens-flare-effect.js';
+export { SmaaEffect } from './effects/smaa/smaa-effect.js';
+export { SsaoEffect } from './effects/ssao/ssao-effect.js';
+export { TaaEffect } from './effects/taa/taa-effect.js';
+export { VignetteEffect } from './effects/vignette/vignette-effect.js';
+export { VolumetricFogEffect } from './effects/volumetric-fog/volumetric-fog-effect.js';
+
+// INPUT
+export { InputDelta, InputFrame, InputSource, InputConsumer, InputController } from './input/input.js';
+export { Pose } from './input/pose.js';
+
+// INPUT SOURCES
+export { SingleGestureSource } from './input/sources/single-gesture-source.js';
+export { DualGestureSource } from './input/sources/dual-gesture-source.js';
+export { MultiTouchSource } from './input/sources/multi-touch-source.js';
+export { KeyboardMouseSource } from './input/sources/keyboard-mouse-source.js';
+export { GamepadSource } from './input/sources/gamepad-source.js';
+
+// INPUT CONTROLLERS
+export { FlyController } from './input/controllers/fly-controller.js';
+export { OrbitController } from './input/controllers/orbit-controller.js';
+export { FocusController } from './input/controllers/focus-controller.js';
+
+// GIZMOS
+export {
+    GIZMOSPACE_LOCAL,
+    GIZMOSPACE_WORLD,
+    GIZMOAXIS_X,
+    GIZMOAXIS_Y,
+    GIZMOAXIS_Z,
+    GIZMOAXIS_XY,
+    GIZMOAXIS_XZ,
+    GIZMOAXIS_YZ,
+    GIZMOAXIS_XYZ,
+    GIZMOAXIS_FACE
+} from './gizmo/constants.js';
+export { Gizmo } from './gizmo/gizmo.js';
+export { DragGizmo } from './gizmo/drag-gizmo.js';
+export { TransformGizmo } from './gizmo/transform/transform-gizmo.js';
+export { TranslateGizmo } from './gizmo/transform/translate-gizmo.js';
+export { RotateGizmo } from './gizmo/transform/rotate-gizmo.js';
+export { ScaleGizmo } from './gizmo/transform/scale-gizmo.js';
+export { HandleGizmo } from './gizmo/handle/handle-gizmo.js';
+export { ShapeGizmo } from './gizmo/handle/shape-gizmo.js';
+export { BoxGizmo } from './gizmo/handle/box-gizmo.js';
+export { SphereGizmo } from './gizmo/handle/sphere-gizmo.js';
+export { CapsuleGizmo } from './gizmo/handle/capsule-gizmo.js';
+export { ConeGizmo } from './gizmo/handle/cone-gizmo.js';
+export { CylinderGizmo } from './gizmo/handle/cylinder-gizmo.js';
+export { BoundingBoxGizmo } from './gizmo/handle/bounding-box-gizmo.js';
+export { CameraGizmo } from './gizmo/handle/camera-gizmo.js';
+export { LightGizmo } from './gizmo/handle/light-gizmo.js';
+export { IconGizmo } from './gizmo/icon-gizmo.js';
+export { ViewCube } from './gizmo/view-cube.js';

@@ -1,0 +1,404 @@
+import { expect } from 'chai';
+
+import { PIXELFORMAT_111110F } from '../../../src/deprecated/deprecated.js';
+import {
+    PIXELFORMAT_RG11B10F, PIXELFORMAT_RGBA8, PIXELFORMAT_SRGBA8, PIXELFORMAT_DXT1, PIXELFORMAT_DXT1_SRGB,
+    PIXELFORMAT_RGBA16F, PIXELFORMAT_RGBA32F, TEXTURELOCK_READ, isMultisampleCapablePixelFormat
+} from '../../../src/platform/graphics/constants.js';
+import { Texture } from '../../../src/platform/graphics/texture.js';
+import { createGraphicsDevice } from '../../device.mjs';
+import { jsdomSetup, jsdomTeardown } from '../../jsdom.mjs';
+
+describe('Texture', function () {
+
+    /** @type {import('../../../src/platform/graphics/graphics-device.js').GraphicsDevice} */
+    let device;
+
+    beforeEach(function () {
+        jsdomSetup();
+        const canvas = document.createElement('canvas');
+        device = createGraphicsDevice(canvas);
+    });
+
+    afterEach(function () {
+        device.destroy();
+        device = null;
+        jsdomTeardown();
+    });
+
+    describe('#constructor: srgb option', function () {
+
+        it('creates the sRGB variant of the format when srgb is true', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8, srgb: true });
+            expect(texture.format).to.equal(PIXELFORMAT_SRGBA8);
+            expect(texture.srgb).to.be.true;
+            texture.destroy();
+        });
+
+        it('creates the sRGB variant of a compressed format when srgb is true', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_DXT1, srgb: true });
+            expect(texture.format).to.equal(PIXELFORMAT_DXT1_SRGB);
+            texture.destroy();
+        });
+
+        it('keeps the requested format when srgb is not set', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8 });
+            expect(texture.format).to.equal(PIXELFORMAT_RGBA8);
+            expect(texture.srgb).to.be.false;
+            texture.destroy();
+        });
+
+        it('ignores srgb for a format with no sRGB variant', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA16F, srgb: true });
+            expect(texture.format).to.equal(PIXELFORMAT_RGBA16F);
+            texture.destroy();
+        });
+    });
+
+    describe('#constructor: samples option', function () {
+
+        it('defaults to 1', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA16F });
+            expect(texture.samples).to.equal(1);
+            texture.destroy();
+        });
+
+        it('is ignored with a warning on a non-WebGPU device', function () {
+            device.isWebGPU = false;
+            const warn = console.warn;
+            const messages = [];
+            console.warn = (...args) => {
+                messages.push(args.join(' '));
+            };
+            try {
+                const texture = new Texture(device, { name: 'msTex', format: PIXELFORMAT_RGBA16F, samples: 4 });
+                expect(texture.samples).to.equal(1);
+                expect(messages.some(m => m.includes('samples'))).to.be.true;
+                texture.destroy();
+            } finally {
+                console.warn = warn;
+            }
+        });
+
+        it('is normalized to the device sample count on WebGPU', function () {
+            device.isWebGPU = true;
+            device.maxSamples = 4;
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA16F, samples: 2 });
+            expect(texture.samples).to.equal(4);
+            texture.destroy();
+        });
+
+        it('forces mipmaps off on a multisampled texture', function () {
+            device.isWebGPU = true;
+            device.maxSamples = 4;
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA16F, samples: 4, mipmaps: true, width: 16, height: 16 });
+            expect(texture.mipmaps).to.be.false;
+            expect(texture.numLevels).to.equal(1);
+            texture.destroy();
+        });
+
+        it('accounts for the sample count in gpuSize and VRAM tracking', function () {
+            device.isWebGPU = true;
+            device.maxSamples = 4;
+            const before = device._vram.tex;
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8, width: 8, height: 8, samples: 4 });
+
+            // 8x8 * 4 bytes * 4 samples
+            expect(texture.gpuSize).to.equal(1024);
+
+            // tracked at creation (a multisampled texture is never uploaded)
+            expect(device._vram.tex - before).to.equal(1024);
+
+            // re-accounted across a resize
+            texture.resize(4, 4);
+            expect(device._vram.tex - before).to.equal(256);
+
+            // released on destroy
+            texture.destroy();
+            expect(device._vram.tex).to.equal(before);
+        });
+
+        it('reports multisample capability per format, including feature-gated RG11B10F', function () {
+            expect(isMultisampleCapablePixelFormat(PIXELFORMAT_RGBA8)).to.be.true;
+            expect(isMultisampleCapablePixelFormat(PIXELFORMAT_RG11B10F)).to.be.true;
+            expect(isMultisampleCapablePixelFormat(PIXELFORMAT_RGBA32F)).to.be.false;
+        });
+
+        it('keeps the deprecated PIXELFORMAT_111110F as an alias of PIXELFORMAT_RG11B10F', function () {
+            expect(PIXELFORMAT_111110F).to.equal(PIXELFORMAT_RG11B10F);
+        });
+
+        it('asserts on a multisampled texture with an incapable format', function () {
+            // a real WebGPU device rejects the texture as well, which is what the assert guards
+            if (device.isWebGPU) {
+                this.skip();
+            }
+            device.isWebGPU = true;
+            device.maxSamples = 4;
+            const error = console.error;
+            const errors = [];
+            console.error = (...args) => {
+                errors.push(args.join(' '));
+            };
+            try {
+                const texture = new Texture(device, { format: PIXELFORMAT_RG11B10F, width: 8, height: 8, samples: 4 });
+                expect(errors).to.have.lengthOf(0);
+                texture.destroy();
+
+                const texture2 = new Texture(device, { format: PIXELFORMAT_RGBA32F, width: 8, height: 8, samples: 4 });
+                expect(errors.some(m => m.includes('does not support multisampling'))).to.be.true;
+                texture2.destroy();
+            } finally {
+                console.error = error;
+            }
+        });
+    });
+
+    describe('#gpuSize', function () {
+
+        it('accounts for all layers of a texture array', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8, width: 8, height: 8, arrayLength: 3, mipmaps: false });
+
+            // 8x8 * 4 bytes * 3 layers
+            expect(texture.gpuSize).to.equal(768);
+            texture.destroy();
+        });
+
+        it('gives each layer of a texture array a full mip chain', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8, width: 8, height: 8, arrayLength: 3, mipmaps: true });
+
+            // (8x8 + 4x4 + 2x2 + 1x1) * 4 bytes * 3 layers
+            expect(texture.gpuSize).to.equal(1020);
+            texture.destroy();
+        });
+    });
+
+    describe('#gpuSize: volume textures', function () {
+
+        it('accounts for all depth slices of a volume texture', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8, width: 8, height: 8, depth: 4, volume: true, mipmaps: false });
+
+            // 8x8x4 * 4 bytes
+            expect(texture.gpuSize).to.equal(1024);
+            texture.destroy();
+        });
+
+        it('halves the depth of a volume texture with each mip level', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8, width: 8, height: 8, depth: 4, volume: true, mipmaps: true });
+
+            // (8x8x4 + 4x4x2 + 2x2x1 + 1x1x1) * 4 bytes
+            expect(texture.numLevels).to.equal(4);
+            expect(texture.gpuSize).to.equal(1172);
+            texture.destroy();
+        });
+
+        it('counts the mip levels of a volume texture deeper than it is wide and high', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8, width: 4, height: 4, depth: 16, volume: true, mipmaps: true });
+
+            // the depth dominates the mip chain: 16, 8, 4, 2, 1
+            expect(texture.numLevels).to.equal(5);
+
+            // (4x4x16 + 2x2x8 + 1x1x4 + 1x1x2 + 1x1x1) * 4 bytes
+            expect(texture.gpuSize).to.equal(1180);
+            texture.destroy();
+        });
+    });
+
+    describe('#releaseSources', function () {
+
+        it('releases the typed arrays of the levels', function () {
+            const texture = new Texture(device, { width: 2, height: 2, format: PIXELFORMAT_RGBA8, mipmaps: false, levels: [new Uint8Array(16)] });
+            texture.releaseSourceAfterUpload = true;
+            texture.releaseSources();
+            expect(texture.getSource()).to.equal(null);
+            expect(texture.releaseSourceAfterUpload).to.be.false;
+            texture.destroy();
+        });
+
+        it('releases the typed arrays of the cubemap faces', function () {
+            const faces = [0, 1, 2, 3, 4, 5].map(() => new Uint8Array(16));
+            const texture = new Texture(device, { width: 2, height: 2, format: PIXELFORMAT_RGBA8, cubemap: true, mipmaps: false, levels: [faces] });
+            texture.releaseSources();
+            expect(texture.getSource()).to.deep.equal([null, null, null, null, null, null]);
+            texture.destroy();
+        });
+
+        it('keeps the sources it does not own', function () {
+            const canvas = document.createElement('canvas');
+            const texture = new Texture(device, { width: 2, height: 2, format: PIXELFORMAT_RGBA8, mipmaps: false });
+            texture._levels[0] = canvas;
+            texture.releaseSources();
+            expect(texture.getSource()).to.equal(canvas);
+            texture._levels[0] = null;
+            texture.destroy();
+        });
+    });
+
+    describe('#setSource', function () {
+
+        let hadImageBitmap;
+
+        before(function () {
+            // Node has no ImageBitmap: the WebGPU test harness installs a stand-in, else provide one
+            hadImageBitmap = typeof globalThis.ImageBitmap !== 'undefined';
+            if (!hadImageBitmap) {
+                globalThis.ImageBitmap = class {
+                    constructor(width, height) {
+                        this.width = width;
+                        this.height = height;
+                    }
+                };
+            }
+        });
+
+        after(function () {
+            if (!hadImageBitmap) {
+                delete globalThis.ImageBitmap;
+            }
+        });
+
+        const createBitmap = (width, height) => new globalThis.ImageBitmap(width, height, new Uint8ClampedArray(width * height * 4));
+
+        it('sizes the mip chain to a source larger than the texture', function () {
+            // created at the default 4x4 size, with 3 mip levels
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8 });
+            texture.setSource(createBitmap(64, 64));
+
+            expect(texture.width).to.equal(64);
+            expect(texture.numLevels).to.equal(7);
+            texture.destroy();
+        });
+
+        it('sizes the mip chain to a source smaller than the texture', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8, width: 64, height: 64 });
+            texture.setSource(createBitmap(16, 16));
+
+            expect(texture.width).to.equal(16);
+            expect(texture.numLevels).to.equal(5);
+            texture.destroy();
+        });
+
+        it('sizes the mip chain to the 4x4 fallback when the source is rejected', function () {
+            const texture = new Texture(device, { format: PIXELFORMAT_RGBA8, width: 64, height: 64 });
+            texture.setSource(/** @type {any} */ ({ width: 64, height: 64 }));
+
+            expect(texture.width).to.equal(4);
+            expect(texture.numLevels).to.equal(3);
+            texture.destroy();
+        });
+    });
+
+    describe('#lock: cubemap', function () {
+
+        const createCubemap = (options = {}) => new Texture(device, {
+            width: 8,
+            height: 8,
+            format: PIXELFORMAT_RGBA8,
+            cubemap: true,
+            ...options
+        });
+
+        it('stores each face in the requested mip level', function () {
+            const texture = createCubemap();
+
+            for (let level = 0; level < 2; level++) {
+                for (let face = 0; face < 6; face++) {
+                    const data = texture.lock({ level, face });
+                    expect(data.length).to.equal((8 >> level) * (8 >> level) * 4);
+                    texture.unlock();
+                    expect(texture._levels[level][face]).to.equal(data);
+                }
+            }
+
+            texture.destroy();
+        });
+
+        it('returns the face data the texture was created with', function () {
+            const faces = [0, 1, 2, 3, 4, 5].map(() => new Uint8Array(8 * 8 * 4));
+            const texture = createCubemap({ levels: [faces] });
+
+            for (let face = 0; face < 6; face++) {
+                expect(texture.lock({ face, mode: TEXTURELOCK_READ })).to.equal(faces[face]);
+                texture.unlock();
+            }
+
+            texture.destroy();
+        });
+
+        it('flags the face locked for writing as updated', function () {
+            const texture = createCubemap();
+
+            // the state after an upload, which clears the flags
+            texture._levelsUpdated[0].fill(false);
+
+            texture.lock({ face: 2, mode: TEXTURELOCK_READ });
+            texture.unlock();
+            texture.lock({ face: 4 });
+            texture.unlock();
+
+            expect(texture._levelsUpdated[0]).to.deep.equal([false, false, false, false, true, false]);
+
+            texture.destroy();
+        });
+    });
+
+    describe('#copy: multisampled textures', function () {
+
+        let errors;
+        let originalError;
+
+        beforeEach(function () {
+            originalError = console.error;
+            errors = [];
+            console.error = (...args) => {
+                errors.push(args.join(' '));
+            };
+            device.isWebGPU = true;
+            device.maxSamples = 4;
+        });
+
+        afterEach(function () {
+            console.error = originalError;
+        });
+
+        const createMs = (options = {}) => {
+            return new Texture(device, { format: PIXELFORMAT_RGBA16F, width: 8, height: 8, samples: 4, ...options });
+        };
+
+        it('allows a full-texture copy between multisampled textures', function () {
+            const src = createMs({ name: 'src' });
+            const dst = createMs({ name: 'dst' });
+            expect(dst.copy(src)).to.be.true;
+            expect(errors).to.have.lengthOf(0);
+            src.destroy();
+            dst.destroy();
+        });
+
+        it('rejects a copy between different sample counts', function () {
+            const src = createMs({ name: 'src' });
+            const dst = new Texture(device, { name: 'dst', format: PIXELFORMAT_RGBA16F, width: 8, height: 8, mipmaps: false });
+            expect(dst.copy(src)).to.be.false;
+            expect(errors.some(m => m.includes('sample counts'))).to.be.true;
+            src.destroy();
+            dst.destroy();
+        });
+
+        it('rejects a partial copy of multisampled textures', function () {
+            const src = createMs({ name: 'src' });
+            const dst = createMs({ name: 'dst' });
+            expect(dst.copy(src, { width: 4, height: 4 })).to.be.false;
+            expect(errors.some(m => m.includes('entire texture'))).to.be.true;
+            src.destroy();
+            dst.destroy();
+        });
+
+        it('rejects an offset copy of multisampled textures', function () {
+            const src = createMs({ name: 'src', width: 4, height: 4 });
+            const dst = createMs({ name: 'dst' });
+            expect(dst.copy(src, { destX: 4, destY: 4 })).to.be.false;
+            expect(errors.some(m => m.includes('entire texture'))).to.be.true;
+            src.destroy();
+            dst.destroy();
+        });
+    });
+});

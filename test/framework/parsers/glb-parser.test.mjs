@@ -1,0 +1,376 @@
+import { expect } from 'chai';
+import { restore, stub } from 'sinon';
+
+import { Color } from '../../../src/core/math/color.js';
+import {
+    KHR_materials_diffuse_transmission
+} from '../../../src/framework/parsers/glb/extensions/khr-materials-diffuse-transmission.js';
+import { GlbParser } from '../../../src/framework/parsers/glb-parser.js';
+import { Texture } from '../../../src/platform/graphics/texture.js';
+import { StandardMaterial } from '../../../src/scene/materials/standard-material.js';
+import { createApp } from '../../app.mjs';
+import { jsdomSetup, jsdomTeardown } from '../../jsdom.mjs';
+
+describe('GlbParser', function () {
+
+    let app;
+
+    beforeEach(function () {
+        jsdomSetup();
+        app = createApp();
+    });
+
+    afterEach(function () {
+        restore();
+        app?.destroy();
+        app = null;
+        jsdomTeardown();
+    });
+
+    const parseMaterial = (occlusionTexture, extensions) => {
+        const gltf = {
+            asset: { version: '2.0' },
+            scenes: [],
+            nodes: [],
+            materials: [{ occlusionTexture, extensions }]
+        };
+        const data = new TextEncoder().encode(JSON.stringify(gltf));
+
+        return new Promise((resolve, reject) => {
+            GlbParser.parse('material.gltf', '', data, app.graphicsDevice, app.assets, {}, [], (err, result) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(result.materials[0]);
+                }
+            });
+        });
+    };
+
+    it('imports occlusion texture strength', async function () {
+        const material = await parseMaterial({ index: 0, strength: 0.5 });
+
+        expect(material.aoIntensity).to.equal(0.5);
+    });
+
+    it('imports zero occlusion texture strength', async function () {
+        const material = await parseMaterial({ index: 0, strength: 0 });
+
+        expect(material.aoIntensity).to.equal(0);
+    });
+
+    it('uses the default occlusion texture strength when omitted', async function () {
+        const material = await parseMaterial({ index: 0 });
+
+        expect(material.aoIntensity).to.equal(1);
+    });
+
+    it('uses the asset registry application for cameras and lights', async function () {
+        const gltf = {
+            asset: { version: '2.0' },
+            scene: 0,
+            scenes: [{ nodes: [0, 1] }],
+            nodes: [
+                { name: 'CameraNode', camera: 0 },
+                {
+                    name: 'LightNode',
+                    extensions: {
+                        KHR_lights_punctual: { light: 0 }
+                    }
+                }
+            ],
+            cameras: [{
+                name: 'Camera',
+                type: 'perspective',
+                perspective: {
+                    yfov: Math.PI / 4,
+                    znear: 0.1,
+                    zfar: 1000
+                }
+            }],
+            extensions: {
+                KHR_lights_punctual: {
+                    lights: [{ type: 'point' }]
+                }
+            }
+        };
+        const data = new TextEncoder().encode(JSON.stringify(gltf));
+        const app2 = createApp();
+
+        try {
+            const result = await new Promise((resolve, reject) => {
+                GlbParser.parse('components.gltf', '', data, app.graphicsDevice, app.assets, {}, [], (err, result) => {
+                    if (err) reject(err);
+                    else resolve(result);
+                });
+            });
+
+            const cameraEntity = result.cameras.get(result.gltf.nodes[0]);
+            const lightEntity = result.lights.get(result.gltf.nodes[1]);
+
+            expect(cameraEntity._app).to.equal(app);
+            expect(cameraEntity.camera.system).to.equal(app.systems.camera);
+            expect(lightEntity._app).to.equal(app);
+            expect(lightEntity.light.system).to.equal(app.systems.light);
+        } finally {
+            app2.destroy();
+        }
+    });
+
+    describe('KHR_materials_diffuse_transmission', function () {
+
+        const parseExtension = (extension) => {
+            return parseMaterial(undefined, { KHR_materials_diffuse_transmission: extension });
+        };
+
+        it('imports the transmission and its color, which is converted to sRGB', async function () {
+            const material = await parseExtension({
+                diffuseTransmissionFactor: 0.25,
+                diffuseTransmissionColorFactor: [1, 0.5, 0.25]
+            });
+
+            expect(material.diffuseTransmission).to.equal(0.25);
+            const expected = new Color(1, 0.5, 0.25).gamma();
+            expect(material.diffuseTransmissionColor.r).to.be.closeTo(expected.r, 1e-6);
+            expect(material.diffuseTransmissionColor.g).to.be.closeTo(expected.g, 1e-6);
+            expect(material.diffuseTransmissionColor.b).to.be.closeTo(expected.b, 1e-6);
+        });
+
+        it('uses the defaults of the extension for the values it omits', async function () {
+            const material = await parseExtension({});
+
+            expect(material.diffuseTransmission).to.equal(0);
+            expect(material.diffuseTransmissionColor.equals(Color.WHITE)).to.equal(true);
+        });
+
+        it('reads the transmission from the alpha channel of its texture', function () {
+            const material = new StandardMaterial();
+            const textures = [new Texture(app.graphicsDevice), new Texture(app.graphicsDevice)];
+            KHR_materials_diffuse_transmission.apply({
+                diffuseTransmissionFactor: 1,
+                diffuseTransmissionTexture: { index: 0, texCoord: 1 },
+                diffuseTransmissionColorTexture: {
+                    index: 1,
+                    extensions: { KHR_texture_transform: { scale: [2, 3] } }
+                }
+            }, material, textures);
+
+            expect(material.diffuseTransmissionMap).to.equal(textures[0]);
+            expect(material.diffuseTransmissionMapChannel).to.equal('a');
+            expect(material.diffuseTransmissionMapUv).to.equal(1);
+            expect(material.diffuseTransmissionColorMap).to.equal(textures[1]);
+            expect(material.diffuseTransmissionColorMapChannel).to.equal('rgb');
+            expect(material.diffuseTransmissionColorMapTiling.x).to.equal(2);
+            expect(material.diffuseTransmissionColorMapTiling.y).to.equal(3);
+        });
+
+        it('loads only the color texture as sRGB', function () {
+            const colorTexture = { index: 1 };
+            expect(KHR_materials_diffuse_transmission.getColorTextures({
+                diffuseTransmissionTexture: { index: 0 },
+                diffuseTransmissionColorTexture: colorTexture
+            })).to.deep.equal([colorTexture]);
+            expect(KHR_materials_diffuse_transmission.getColorTextures({
+                diffuseTransmissionTexture: { index: 0 }
+            })).to.deep.equal([]);
+        });
+    });
+
+    describe('KHR_materials_sheen', function () {
+
+        const parseExtension = (extension) => {
+            return parseMaterial(undefined, { KHR_materials_sheen: extension });
+        };
+
+        it('imports the sheen color factor in gamma space', async function () {
+            const material = await parseExtension({ sheenColorFactor: [0.5, 0.25, 1] });
+
+            expect(material.useSheen).to.equal(true);
+            expect(material.sheen).to.deep.equal(new Color(0.5, 0.25, 1).gamma());
+        });
+
+        it('defaults the sheen color to black when the sheen color factor is omitted', async function () {
+            const material = await parseExtension({ sheenRoughnessFactor: 0.5 });
+
+            expect(material.useSheen).to.equal(true);
+            expect(material.sheen).to.deep.equal(new Color(0, 0, 0));
+        });
+
+        it('defaults the sheen color to black when only a sheen color texture is given', async function () {
+            const material = await parseExtension({ sheenColorTexture: { index: 0 } });
+
+            // the factor multiplies the texture, so the texture alone gives no sheen
+            expect(material.sheen).to.deep.equal(new Color(0, 0, 0));
+        });
+    });
+
+    describe('flat shading of primitives without normals', function () {
+
+        // three vertices, and indices referencing all three of them - enough to form a single
+        // triangle, or three points, depending on the primitive mode used
+        const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+        const indices = new Uint16Array([0, 1, 2]);
+        const bytes = new Uint8Array(positions.byteLength + indices.byteLength);
+        bytes.set(new Uint8Array(positions.buffer), 0);
+        bytes.set(new Uint8Array(indices.buffer), positions.byteLength);
+        const bufferUri = `data:application/octet-stream;base64,${Buffer.from(bytes).toString('base64')}`;
+
+        // glTF primitive modes, see the mesh.primitive.mode schema
+        const MODE_POINTS = 0;
+        const MODE_TRIANGLE_STRIP = 5;
+
+        /**
+         * Parses a glTF containing a single primitive built from the vertex data above. Accessor 0
+         * holds the positions, accessor 1 the normals, and accessor 2 the indices.
+         *
+         * @param {object} [options] - The primitive options.
+         * @param {boolean} [options.normals] - True to supply the NORMAL attribute. Defaults to false.
+         * @param {number} [options.mode] - The glTF primitive mode. Omitted means triangles, which is
+         * the glTF default.
+         * @param {boolean} [options.material] - False to leave the primitive without a material of its
+         * own. Defaults to true.
+         * @param {object} [options.extensions] - Extensions placed on the primitive.
+         * @param {object[]} [options.resourceExtensions] - Resource extensions registered with the
+         * parser.
+         * @returns {Promise<object>} The parse result.
+         */
+        const parsePrimitive = ({ normals = false, mode, material = true, extensions, resourceExtensions = [] } = {}) => {
+            const primitive = {
+                attributes: normals ? { POSITION: 0, NORMAL: 1 } : { POSITION: 0 },
+                indices: 2
+            };
+            if (material) {
+                primitive.material = 0;
+            }
+            if (mode !== undefined) {
+                primitive.mode = mode;
+            }
+            if (extensions) {
+                primitive.extensions = extensions;
+            }
+
+            const gltf = {
+                asset: { version: '2.0' },
+                scene: 0,
+                scenes: [{ nodes: [0] }],
+                nodes: [{ mesh: 0 }],
+                meshes: [{ primitives: [primitive] }],
+                materials: [{ name: 'primitiveMaterial' }],
+                accessors: [
+                    { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 0, 0], max: [1, 1, 0] },
+                    { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' },
+                    { bufferView: 1, componentType: 5123, count: 3, type: 'SCALAR' }
+                ],
+                bufferViews: [
+                    { buffer: 0, byteOffset: 0, byteLength: positions.byteLength },
+                    { buffer: 0, byteOffset: positions.byteLength, byteLength: indices.byteLength }
+                ],
+                buffers: [{ byteLength: bytes.length, uri: bufferUri }]
+            };
+            const data = new TextEncoder().encode(JSON.stringify(gltf));
+
+            return new Promise((resolve, reject) => {
+                GlbParser.parse('primitive.gltf', '', data, app.graphicsDevice, app.assets, {}, resourceExtensions, (err, result) => {
+                    if (err) reject(err);
+                    else resolve(result);
+                });
+            });
+        };
+
+        it('flat shades a triangle primitive without normals, using a material clone', async function () {
+            const result = await parsePrimitive();
+
+            // the source material is untouched, and a flat shaded clone is appended
+            expect(result.materials.length).to.equal(2);
+            expect(result.materials[0].flatShading).to.equal(false);
+            expect(result.materials[1].flatShading).to.equal(true);
+            expect(result.materials[1].name).to.equal('primitiveMaterial-flatShaded');
+
+            // the mesh uses the clone
+            const mesh = result.renders[0].meshes[0];
+            expect(result.meshDefaultMaterials[mesh.id]).to.equal(1);
+        });
+
+        it('flat shades a triangle strip primitive without normals', async function () {
+            const result = await parsePrimitive({ mode: MODE_TRIANGLE_STRIP });
+
+            expect(result.materials.length).to.equal(2);
+            expect(result.materials[1].flatShading).to.equal(true);
+        });
+
+        it('does not flat shade a primitive which supplies normals', async function () {
+            const result = await parsePrimitive({ normals: true });
+
+            expect(result.materials.length).to.equal(1);
+            expect(result.materials[0].flatShading).to.equal(false);
+
+            const mesh = result.renders[0].meshes[0];
+            expect(result.meshDefaultMaterials[mesh.id]).to.equal(0);
+        });
+
+        it('does not flat shade a points primitive, which has no face normal', async function () {
+            const result = await parsePrimitive({ mode: MODE_POINTS });
+
+            expect(result.materials.length).to.equal(1);
+            expect(result.materials[0].flatShading).to.equal(false);
+        });
+
+        it('uses the point mesh fallback when a primitive resource extension is not registered', async function () {
+            const result = await parsePrimitive({
+                mode: MODE_POINTS,
+                extensions: { TEST_points: {} }
+            });
+
+            expect(result.renders[0].meshes).to.have.lengthOf(1);
+            expect(result.testResources).to.be.undefined;
+        });
+
+        it('uses a registered primitive resource extension instead of the point mesh fallback', async function () {
+            const resource = {};
+            const extension = {
+                name: 'TEST_points',
+                resourceName: 'testResources',
+                handlesPrimitive: primitive => !!primitive.extensions?.TEST_points,
+                createResources: () => [[resource]]
+            };
+            const result = await parsePrimitive({
+                mode: MODE_POINTS,
+                extensions: { TEST_points: {} },
+                resourceExtensions: [extension]
+            });
+
+            expect(result.renders[0].meshes).to.be.empty;
+            expect(result.testResources).to.deep.equal([[resource]]);
+        });
+
+        it('asserts when a resource extension overwrites a core parse result member', async function () {
+            const error = stub(console, 'error');
+            const extension = {
+                name: 'TEST_collision',
+                resourceName: 'destroy',
+                handlesPrimitive: () => false,
+                createResources: () => []
+            };
+
+            await parsePrimitive({ resourceExtensions: [extension] });
+
+            expect(error.calledWith(
+                'ASSERT FAILED: ',
+                'GLB resource extension \'TEST_collision\' would overwrite \'destroy\''
+            )).to.equal(true);
+        });
+
+        it('builds a flat shaded default material for a primitive with no material of its own', async function () {
+            const result = await parsePrimitive({ material: false });
+
+            // such a primitive is otherwise rendered with the glTF default material, which is shared
+            // by the container and so must not be modified - a matching one is appended instead
+            expect(result.materials.length).to.equal(2);
+            expect(result.materials[1].flatShading).to.equal(true);
+            expect(result.materials[1].name).to.equal('defaultGlbMaterial-flatShaded');
+
+            const mesh = result.renders[0].meshes[0];
+            expect(result.meshDefaultMaterials[mesh.id]).to.equal(1);
+        });
+    });
+});

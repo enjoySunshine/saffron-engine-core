@@ -1,0 +1,131 @@
+import { ShaderProcessorOptions } from '../../platform/graphics/shader-processor-options.js';
+import { DITHER_NONE, FRESNEL_SCHLICK, SPECOCC_AO } from '../constants.js';
+import { Material } from './material.js';
+import { LitMaterialOptions } from './lit-material-options.js';
+import { LitMaterialOptionsBuilder } from './lit-material-options-builder.js';
+import { getProgramLibrary } from '../shader-lib/get-program-library.js';
+import { lit } from '../shader-lib/programs/lit.js';
+import { ShaderUtils } from '../shader-lib/shader-utils.js';
+import { getViewTextures } from '../renderer/view-textures.js';
+
+const options = new LitMaterialOptions();
+
+/**
+ * LitMaterial comprises a shader chunk implementing the material "front end" (the shader program
+ * providing the material surface properties like diffuse, opacity, normals etc) and a set of
+ * flags which control the material "back end" (the shader program calculating the lighting,
+ * shadows, reflections, fogging etc).
+ *
+ * The front end and back end together form a complete PBR shader.
+ *
+ * @ignore
+ */
+class LitMaterial extends Material {
+    /** @ignore */
+    _usesViewTextures = true;
+
+    usedUvs = [true];
+
+    shaderChunkGLSL = null;
+
+    shaderChunkWGSL = null;
+
+    useLighting = true;
+
+    useFog = true;
+
+    useTonemap = true;
+
+    useSkybox = true;
+
+    ambientSH = null;
+
+    pixelSnap = false;
+
+    nineSlicedMode = null;
+
+    twoSidedLighting = false;
+
+    occludeDirect = false;
+
+    occludeSpecular = SPECOCC_AO;
+
+    occludeSpecularIntensity = 1;
+
+    opacityFadesSpecular = true;
+
+    opacityDither = DITHER_NONE;
+
+    opacityShadowDither = DITHER_NONE;
+
+    shadowCatcher = false;
+
+    ggxSpecular = false;
+
+    fresnelModel = FRESNEL_SCHLICK;
+
+    dynamicRefraction = false;
+
+    // has members
+    hasAo = false;
+
+    hasSpecular = false;
+
+    hasSpecularityFactor = false;
+
+    hasLighting = false;
+
+    dirLightMap = false;
+
+    hasHeights = false;
+
+    hasNormals = false;
+
+    hasSheen = false;
+
+    hasRefraction = false;
+
+    hasDispersion = false;
+
+    hasIridescence = false;
+
+    hasDiffuseTransmission = false;
+
+    hasMetalness = false;
+
+    hasClearCoat = false;
+
+    hasClearCoatNormals = false;
+
+    /** @ignore */
+    updateUniforms(device, scene) {
+        super.updateUniforms(device, scene);
+
+        // a uniform, the shader always contains both ways of applying the ambient occlusion
+        this.setParameter('material_occludeDirect', this.occludeDirect ? 1 : 0);
+
+        // a uniform, the shader always contains the flip of the normals of the back faces
+        this.setParameter('material_twoSidedLighting', this.twoSidedLighting ? 1 : 0);
+
+        // a uniform, the shader always applies the intensity of the specular occlusion
+        this.setParameter('material_occludeSpecularIntensity', this.occludeSpecularIntensity);
+    }
+
+    /** @ignore */
+    getShaderVariant(params) {
+
+        options.usedUvs = this.usedUvs.slice();
+        options.shaderChunkGLSL = this.shaderChunkGLSL;
+        options.shaderChunkWGSL = this.shaderChunkWGSL;
+        options.defines = ShaderUtils.getCoreDefines(this, params);
+
+        LitMaterialOptionsBuilder.update(options.litOptions, this, params.scene, params.cameraShaderParams, params.objDefs, params.pass, params.lightList);
+        const processingOptions = new ShaderProcessorOptions(params.viewUniformFormat, params.vertexFormat, getViewTextures(params.viewUniformFormat));
+        const library = getProgramLibrary(params.device);
+        library.register('lit', lit);
+        const shader = library.getProgram('lit', options, processingOptions, this.userId);
+        return shader;
+    }
+}
+
+export { LitMaterial };

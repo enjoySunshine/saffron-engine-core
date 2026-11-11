@@ -1,0 +1,204 @@
+import { Debug } from '../../core/debug.js';
+import { PIXELFORMAT_RGBA8, PIXELFORMAT_RGBA32F } from '../../platform/graphics/constants.js';
+import { GSplatResourceBase } from './gsplat-resource-base.js';
+import { GSplatFormat } from './gsplat-format.js';
+import { blindAccessors, parseBlindFields } from './gsplat-sog-blind.js';
+
+/**
+ * @import { GSplatSogData } from './gsplat-sog-data.js'
+ * @import { GraphicsDevice } from '../../platform/graphics/graphics-device.js'
+ */
+
+/**
+ * A Gaussian splat resource that stores splat data in the compressed SOG format. Created when
+ * loading SOG files (a `meta.json` file or a `.sog` bundle), unless their asset data sets
+ * `decompress` to true.
+ *
+ * @category Graphics
+ */
+class GSplatSogResource extends GSplatResourceBase {
+    /**
+     * The `SOG_BLIND_<name>` define of each blind field, built once so setting the material
+     * defines on every work buffer update allocates nothing.
+     *
+     * @type {string[]}
+     * @private
+     */
+    _blindDefines;
+
+    /**
+     * @param {GraphicsDevice} device - The graphics device.
+     * @param {GSplatSogData} gsplatData - The splat data.
+     * @param {object} [options] - Passed to {@link GSplatResourceBase} constructor.
+     * @ignore
+     */
+    constructor(device, gsplatData, options = {}) {
+        super(device, gsplatData, options);
+
+        const { meta, means_l } = gsplatData;
+        // V2 and V3 both dequantize through the codebook LUT; V3 drops the quats texture (the
+        // rotation is packed into the alpha channels of means_l, means_u and scales)
+        const isV2 = meta.version >= 2;
+        const isV3 = meta.version === 3;
+        const hasSH = gsplatData.shBands > 0;
+
+        // splat texture dimensions come from the source means_l texture - used for the
+        // splatTextureSize uniform and for sizing the order texture
+        if (means_l) {
+            this.streams.textureDimensions.set(means_l.width, means_l.height);
+        }
+
+        // register externally-owned source textures for auto-binding (owned by gsplatData,
+        // not destroyed here)
+        this.streams.textures.set('means_l', gsplatData.means_l);
+        this.streams.textures.set('means_u', gsplatData.means_u);
+        if (!isV3) {
+            this.streams.textures.set('quats', gsplatData.quats);
+        }
+        this.streams.textures.set('scales', gsplatData.scales);
+        this.streams.textures.set('sh0', gsplatData.sh0);
+        if (hasSH) {
+            this.streams.textures.set('sh_labels', gsplatData.sh_labels);
+            this.streams.textures.set('sh_centroids', gsplatData.sh_centroids);
+        }
+        gsplatData.blind.forEach((texture, i) => {
+            this.streams.textures.set(`blind${i}`, texture);
+        });
+        if (isV2) {
+            // V2 always declares the sogCodebook stream below, so the texture must exist or the
+            // streams system would auto-create a default (wrong-sized) RGBA32F texture at bind.
+            // Callers must invoke gsplatData.prepareCodebook() before constructing the resource.
+            Debug.assert(gsplatData.codebookTexture, 'GSplatSogResource: V2 asset is missing codebookTexture - prepareCodebook() must be called first.');
+            this.streams.textures.set('sogCodebook', gsplatData.codebookTexture);
+        }
+
+        // declare streams matching the registered textures; formats drive generated uniform
+        // declarations and load functions for the read shader chunk
+        const streams = [
+            { name: 'means_l', format: PIXELFORMAT_RGBA8 },
+            { name: 'means_u', format: PIXELFORMAT_RGBA8 },
+            ...(isV3 ? [] : [{ name: 'quats', format: PIXELFORMAT_RGBA8 }]),
+            { name: 'scales', format: PIXELFORMAT_RGBA8 },
+            { name: 'sh0', format: PIXELFORMAT_RGBA8 }
+        ];
+        if (hasSH) {
+            streams.push({ name: 'sh_labels', format: PIXELFORMAT_RGBA8 });
+            streams.push({ name: 'sh_centroids', format: PIXELFORMAT_RGBA8 });
+        }
+        // per-gaussian user data, one stream per blind texture, read in shaders through the
+        // generated getBlind_<name>() accessors (see gsplat-sog-blind.js)
+        for (let i = 0; i < gsplatData.blind.length; i++) {
+            streams.push({ name: `blind${i}`, format: PIXELFORMAT_RGBA8 });
+        }
+        if (isV2) {
+            streams.push({ name: 'sogCodebook', format: PIXELFORMAT_RGBA32F });
+        }
+
+        const fields = parseBlindFields(meta);
+        this._blindDefines = fields.map(f => `SOG_BLIND_${f.id}`);
+
+        // Create format with streams and shader chunk include. The format only uses the read code
+        // of the device's shader language, so only that one is generated.
+        // Note: We don't call streams.init() as textures are externally managed by gsplatData
+        const read = `#include "gsplatSogVS"${blindAccessors(fields, device.isWebGPU)}`;
+        this._format = new GSplatFormat(device, streams, {
+            readGLSL: read,
+            readWGSL: read
+        });
+
+        // Populate parameters map with dequantization uniforms
+        this._populateParameters();
+    }
+
+    /**
+     * Opts each of the owned source textures into releasing its CPU-side ImageBitmap after
+     * upload. Called by the gsplat octree, which re-creates these resources from scratch on
+     * device loss and therefore does not need the CPU source retained for re-upload.
+     *
+     * @ignore
+     */
+    releaseTextureSources() {
+        const d = /** @type {GSplatSogData} */ (this.gsplatData);
+        d.means_l?.setReleaseSourceAfterUpload();
+        d.means_u?.setReleaseSourceAfterUpload();
+        d.quats?.setReleaseSourceAfterUpload();
+        d.scales?.setReleaseSourceAfterUpload();
+        d.sh0?.setReleaseSourceAfterUpload();
+        d.sh_centroids?.setReleaseSourceAfterUpload();
+        d.sh_labels?.setReleaseSourceAfterUpload();
+        d.blind.forEach(t => t.setReleaseSourceAfterUpload());
+    }
+
+    /** @protected */
+    _actualDestroy() {
+        // Remove externally-owned textures without destroying them (they're owned by gsplatData)
+        this.streams.textures.delete('means_l');
+        this.streams.textures.delete('means_u');
+        this.streams.textures.delete('quats');
+        this.streams.textures.delete('scales');
+        this.streams.textures.delete('sh0');
+        this.streams.textures.delete('sh_labels');
+        this.streams.textures.delete('sh_centroids');
+        /** @type {GSplatSogData} */ (this.gsplatData).blind.forEach((t, i) => this.streams.textures.delete(`blind${i}`));
+        this.streams.textures.delete('sogCodebook');
+        /** @type {GSplatSogData} */ (this.gsplatData).destroy();
+        super._actualDestroy();
+    }
+
+    /**
+     * Populates the parameters map with dequantization uniforms.
+     * V1 needs per-axis/component min/max ranges. V2 derives everything from the codebook LUT
+     * texture so only the means min/max are required.
+     *
+     * @private
+     */
+    _populateParameters() {
+        const { meta } = /** @type {GSplatSogData} */ (this.gsplatData);
+
+        // means
+        if (meta.means) {
+            this.parameters.set('means_mins', meta.means.mins);
+            this.parameters.set('means_maxs', meta.means.maxs);
+        }
+
+        if (!(meta.version >= 2)) {
+            // V1: upload full min/max arrays for linear dequantization
+            if (meta.scales) {
+                this.parameters.set('scales_mins', meta.scales.mins);
+                this.parameters.set('scales_maxs', meta.scales.maxs);
+            }
+            if (meta.sh0) {
+                this.parameters.set('sh0_mins', meta.sh0.mins);
+                this.parameters.set('sh0_maxs', meta.sh0.maxs);
+            }
+            if (meta.shN) {
+                this.parameters.set('shN_mins', meta.shN.mins);
+                this.parameters.set('shN_maxs', meta.shN.maxs);
+            }
+        }
+    }
+
+    configureMaterialDefines(defines) {
+        const gsplatData = /** @type {GSplatSogData} */ (this.gsplatData);
+        defines.set('SH_BANDS', gsplatData.shBands);
+        const { meta } = gsplatData;
+        // the format version (v1 files have none): 2 and up dequantize through codebooks, 3 adds the
+        // exp-map rotations, squared opacity and 24-bit SH labels
+        defines.set('SOG_VERSION', meta.version ?? 1);
+        for (const define of this._blindDefines) {
+            defines.set(define, '');
+        }
+    }
+
+    // SOG geometry getters compile out under GSPLAT_WORKBUFFER_GEOMETRY (see sog.js chunk),
+    // letting color-only (SH) updates skip the means/quats/scales source reads
+    get supportsWorkBufferGeometry() {
+        return true;
+    }
+
+    get extras() {
+        return /** @type {GSplatSogData} */ (this.gsplatData).meta.extras;
+    }
+}
+
+export { GSplatSogResource };

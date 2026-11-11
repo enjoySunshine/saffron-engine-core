@@ -1,0 +1,978 @@
+import { path } from '../../core/path.js';
+import { Debug } from '../../core/debug.js';
+import { Tracing } from '../../core/tracing.js';
+import { TRACEID_ASSETS } from '../../core/constants.js';
+import { EventHandler } from '../../core/event-handler.js';
+import { TagsCache } from '../../core/tags-cache.js';
+import { standardMaterialTextureParameters } from '../../scene/materials/standard-material-parameters.js';
+import { Asset } from './asset.js';
+
+/**
+ * @import { AssetType } from './asset.js'
+ * @import { Bundle } from '../bundle/bundle.js'
+ * @import { BundleRegistry } from '../bundle/bundle-registry.js'
+ * @import { ResourceLoader } from '../handlers/loader.js'
+ */
+
+/**
+ * @callback FilterAssetCallback
+ * Callback used by {@link AssetRegistry#filter} to filter assets.
+ * @param {Asset} asset - The current asset to filter.
+ * @returns {boolean} Return `true` to include asset to result list.
+ */
+
+/**
+ * @template {AssetType | (string & {})} [Type=string]
+ * @callback LoadAssetCallback
+ * Callback used by {@link AssetRegistry#loadFromUrl} and called when an asset is loaded (or an
+ * error occurs).
+ * @param {string|null} err - The error message is null if no errors were encountered.
+ * @param {Asset<Type>} [asset] - The loaded asset if no errors were encountered. Its type follows the
+ * `type` passed to {@link AssetRegistry#loadFromUrl}.
+ * @returns {void}
+ */
+
+/**
+ * @callback BundlesFilterCallback
+ * Callback used by {@link ResourceLoader#load} and called when an asset is choosing a bundle
+ * to load from. Return a single bundle to ensure asset is loaded from it.
+ * @param {Asset[]} bundles - List of bundle assets which contain the asset.
+ * @returns {Asset} Return a single bundle asset to ensure asset is loaded from it.
+ */
+
+/**
+ * The AssetRegistry holds every {@link Asset} an application knows about and drives their loading
+ * through the {@link ResourceLoader}. Each application has one at {@link AppBase#assets}.
+ *
+ * Look assets up by id with {@link get}, by name and type with {@link find} and {@link findAll}, by
+ * URL with {@link getByUrl}, or by tag with {@link findByTag}. Register an asset with {@link add},
+ * or create and load one in a single call with {@link loadFromUrl}, which reuses any asset already
+ * registered for that URL.
+ *
+ * Adding an asset does not fetch it unless {@link Asset#preload} is true. Call {@link load} to
+ * fetch it, then wait with {@link Asset#ready} or listen for the registry's `load`, `error`, `add`
+ * and `remove` events. Each also fires per asset as `load:[id]` and, except for `error`, per URL as
+ * `load:url:[url]`.
+ *
+ * @example
+ * const asset = app.assets.find('brick', 'texture');
+ * app.assets.load(asset);
+ * asset.ready((asset) => {
+ *     material.diffuseMap = asset.resource;
+ * });
+ * @example
+ * app.assets.loadFromUrl('models/robot.glb', 'container', (err, asset) => {
+ *     app.root.addChild(asset.resource.instantiateRenderEntity());
+ * });
+ * @category Asset
+ */
+class AssetRegistry extends EventHandler {
+    /**
+     * Fired when an asset completes loading. This event is available in three forms. They are as
+     * follows:
+     *
+     * 1. `load` - Fired when any asset finishes loading.
+     * 2. `load:[id]` - Fired when a specific asset has finished loading, where `[id]` is the
+     * unique id of the asset.
+     * 3. `load:url:[url]` - Fired when an asset finishes loading whose URL matches `[url]`, where
+     * `[url]` is the URL of the asset.
+     *
+     * @event
+     * @example
+     * app.assets.on('load', (asset) => {
+     *     console.log(`Asset loaded: ${asset.name}`);
+     * });
+     * @example
+     * const id = 123456;
+     * const asset = app.assets.get(id);
+     * app.assets.on('load:' + id, (asset) => {
+     *     console.log(`Asset loaded: ${asset.name}`);
+     * });
+     * app.assets.load(asset);
+     * @example
+     * const id = 123456;
+     * const asset = app.assets.get(id);
+     * app.assets.on('load:url:' + asset.file.url, (asset) => {
+     *     console.log(`Asset loaded: ${asset.name}`);
+     * });
+     * app.assets.load(asset);
+     */
+    static EVENT_LOAD = 'load';
+
+    /**
+     * Fired when an asset is added to the registry. This event is available in three forms. They
+     * are as follows:
+     *
+     * 1. `add` - Fired when any asset is added to the registry.
+     * 2. `add:[id]` - Fired when an asset is added to the registry, where `[id]` is the unique id
+     * of the asset.
+     * 3. `add:url:[url]` - Fired when an asset is added to the registry and matches the URL
+     * `[url]`, where `[url]` is the URL of the asset.
+     *
+     * @event
+     * @example
+     * app.assets.on('add', (asset) => {
+     *    console.log(`Asset added: ${asset.name}`);
+     * });
+     * @example
+     * const id = 123456;
+     * app.assets.on('add:' + id, (asset) => {
+     *    console.log(`Asset added: ${asset.name}`);
+     * });
+     * @example
+     * const id = 123456;
+     * const asset = app.assets.get(id);
+     * app.assets.on('add:url:' + asset.file.url, (asset) => {
+     *    console.log(`Asset added: ${asset.name}`);
+     * });
+     */
+    static EVENT_ADD = 'add';
+
+    /**
+     * Fired when an asset is removed from the registry. This event is available in three forms.
+     * They are as follows:
+     *
+     * 1. `remove` - Fired when any asset is removed from the registry.
+     * 2. `remove:[id]` - Fired when an asset is removed from the registry, where `[id]` is the
+     * unique id of the asset.
+     * 3. `remove:url:[url]` - Fired when an asset is removed from the registry and matches the
+     * URL `[url]`, where `[url]` is the URL of the asset.
+     *
+     * @event
+     * @param {Asset} asset - The asset that was removed.
+     * @example
+     * app.assets.on('remove', (asset) => {
+     *    console.log(`Asset removed: ${asset.name}`);
+     * });
+     * @example
+     * const id = 123456;
+     * app.assets.on('remove:' + id, (asset) => {
+     *    console.log(`Asset removed: ${asset.name}`);
+     * });
+     * @example
+     * const id = 123456;
+     * const asset = app.assets.get(id);
+     * app.assets.on('remove:url:' + asset.file.url, (asset) => {
+     *    console.log(`Asset removed: ${asset.name}`);
+     * });
+     */
+    static EVENT_REMOVE = 'remove';
+
+    /**
+     * Fired when an error occurs during asset loading. This event is available in two forms. They
+     * are as follows:
+     *
+     * 1. `error` - Fired when any asset reports an error in loading.
+     * 2. `error:[id]` - Fired when an asset reports an error in loading, where `[id]` is the
+     * unique id of the asset.
+     *
+     * @event
+     * @example
+     * const id = 123456;
+     * const asset = app.assets.get(id);
+     * app.assets.on('error', (err, asset) => {
+     *     console.error(err);
+     * });
+     * app.assets.load(asset);
+     * @example
+     * const id = 123456;
+     * const asset = app.assets.get(id);
+     * app.assets.on('error:' + id, (err, asset) => {
+     *     console.error(err);
+     * });
+     * app.assets.load(asset);
+     */
+    static EVENT_ERROR = 'error';
+
+    /**
+     * @type {Set<Asset>}
+     * @private
+     */
+    _assets = new Set();
+
+    /**
+     * @type {ResourceLoader}
+     * @private
+     */
+    _loader;
+
+    /**
+     * @type {Map<number, Asset>}
+     * @private
+     */
+    _idToAsset = new Map();
+
+    /**
+     * @type {Map<string, Asset>}
+     * @private
+     */
+    _urlToAsset = new Map();
+
+    /**
+     * @type {Map<string, Set<Asset>>}
+     * @private
+     */
+    _nameToAsset = new Map();
+
+    /**
+     * Index for looking up by tags.
+     *
+     * @private
+     */
+    _tags = new TagsCache('id');
+
+    /**
+     * A URL prefix that will be added to all asset loading requests.
+     *
+     * @type {string|null}
+     */
+    prefix = null;
+
+    /**
+     * The bundle registry that tracks which assets are packed into bundle assets and serves
+     * their files from loaded bundles. Assigned when the application creates its bundle registry;
+     * null until then.
+     *
+     * @type {BundleRegistry|null}
+     */
+    bundles = null;
+
+    /**
+     * Create an instance of an AssetRegistry.
+     *
+     * @param {ResourceLoader} loader - The ResourceLoader used to load the asset files.
+     */
+    constructor(loader) {
+        super();
+
+        this._loader = loader;
+    }
+
+    /**
+     * The ResourceLoader used to load asset files.
+     *
+     * @type {ResourceLoader}
+     * @ignore
+     */
+    get loader() {
+        return this._loader;
+    }
+
+    /**
+     * Create a filtered list of assets from the registry.
+     *
+     * @param {object} [filters] - Filter options.
+     * @param {boolean} [filters.preload] - Filter by preload setting.
+     * @returns {Asset[]} The filtered list of assets.
+     */
+    list(filters = {}) {
+        const assets = Array.from(this._assets);
+        if (filters.preload !== undefined) {
+            return assets.filter(asset => asset.preload === filters.preload);
+        }
+        return assets;
+    }
+
+    /**
+     * Add an asset to the registry. If {@link Asset#preload} is `true`, it will also get loaded.
+     *
+     * @param {Asset} asset - The asset to add.
+     * @example
+     * const asset = new Asset("My Asset", "texture", {
+     *     url: "../path/to/image.jpg"
+     * });
+     * app.assets.add(asset);
+     */
+    add(asset) {
+        if (this._assets.has(asset)) return;
+
+        this._assets.add(asset);
+
+        this._idToAsset.set(asset.id, asset);
+
+        if (asset.file?.url) {
+            this._urlToAsset.set(asset.file.url, asset);
+        }
+
+        if (!this._nameToAsset.has(asset.name)) {
+            this._nameToAsset.set(asset.name, new Set());
+        }
+
+        this._nameToAsset.get(asset.name).add(asset);
+
+        asset.on('name', this._onNameChange, this);
+
+        asset.registry = this;
+
+        // tags cache
+        this._tags.addItem(asset);
+        asset.tags.on('add', this._onTagAdd, this);
+        asset.tags.on('remove', this._onTagRemove, this);
+
+        this.fire('add', asset);
+        this.fire(`add:${asset.id}`, asset);
+        if (asset.file?.url) {
+            this.fire(`add:url:${asset.file.url}`, asset);
+        }
+
+        if (asset.preload) {
+            this.load(asset);
+        }
+    }
+
+    /**
+     * Remove an asset from the registry.
+     *
+     * @param {Asset} asset - The asset to remove.
+     * @returns {boolean} True if the asset was successfully removed and false otherwise.
+     * @example
+     * const asset = app.assets.get(100);
+     * app.assets.remove(asset);
+     */
+    remove(asset) {
+        if (!this._assets.has(asset)) return false;
+
+        this._assets.delete(asset);
+
+        this._idToAsset.delete(asset.id);
+
+        if (asset.file?.url) {
+            this._urlToAsset.delete(asset.file.url);
+        }
+
+        asset.off('name', this._onNameChange, this);
+
+        if (this._nameToAsset.has(asset.name)) {
+            const items = this._nameToAsset.get(asset.name);
+            items.delete(asset);
+            if (items.size === 0) {
+                this._nameToAsset.delete(asset.name);
+            }
+        }
+
+        // tags cache
+        this._tags.removeItem(asset);
+        asset.tags.off('add', this._onTagAdd, this);
+        asset.tags.off('remove', this._onTagRemove, this);
+
+        asset.fire('remove', asset);
+        this.fire('remove', asset);
+        this.fire(`remove:${asset.id}`, asset);
+        if (asset.file?.url) {
+            this.fire(`remove:url:${asset.file.url}`, asset);
+        }
+
+        return true;
+    }
+
+    /**
+     * Destroys the registry, releasing all assets held by it. Called by {@link AppBase#destroy}.
+     * Note that this does not destroy the resources of the assets - {@link Asset#unload} needs to
+     * be called for each asset before the registry is destroyed.
+     *
+     * @ignore
+     */
+    destroy() {
+        for (const asset of this._assets) {
+            asset.off('name', this._onNameChange, this);
+            asset.tags.off('add', this._onTagAdd, this);
+            asset.tags.off('remove', this._onTagRemove, this);
+
+            // clear the back-reference, so that an asset which outlives the application does not
+            // keep the registry - and through it all other assets - alive. An asset added to
+            // another registry since points at that one instead, which cannot retain this
+            // registry, so it is left alone.
+            if (asset.registry === this) {
+                asset.registry = null;
+            }
+        }
+
+        this._assets.clear();
+        this._idToAsset.clear();
+        this._urlToAsset.clear();
+        this._nameToAsset.clear();
+
+        this._tags = null;
+        this.bundles = null;
+
+        this.off();
+    }
+
+    /**
+     * Retrieve an asset from the registry by its id field.
+     *
+     * @param {number} id - The id of the asset to get.
+     * @returns {Asset|undefined} The asset.
+     * @example
+     * const asset = app.assets.get(100);
+     */
+    get(id) {
+        // Since some apps incorrectly pass the id as a string, force a conversion to a number
+        return this._idToAsset.get(Number(id));
+    }
+
+    /**
+     * Retrieve an asset from the registry by its file's URL field.
+     *
+     * @param {string} url - The url of the asset to get.
+     * @returns {Asset|undefined} The asset.
+     * @example
+     * const asset = app.assets.getByUrl("../path/to/image.jpg");
+     */
+    getByUrl(url) {
+        return this._urlToAsset.get(url);
+    }
+
+    /**
+     * Load the asset's file from a remote source. Listen for `load` events on the asset to find
+     * out when it is loaded.
+     *
+     * Container-backed render assets wait for the container referenced by `data.containerAsset`
+     * to be registered and loaded before firing `load`. The container can be registered later,
+     * but if it is never registered, the render asset remains loading indefinitely. If that
+     * render asset is marked for preload, it also prevents {@link AppBase#preload} from completing.
+     *
+     * @param {Asset} asset - The asset to load.
+     * @param {object} [options] - Options for asset loading.
+     * @param {boolean} [options.bundlesIgnore] - If set to true, then asset will not try to load
+     * from a bundle. Defaults to false.
+     * @param {boolean} [options.force] - If set to true, then the check of asset being loaded or
+     * is already loaded is bypassed, which forces loading of asset regardless.
+     * @param {BundlesFilterCallback} [options.bundlesFilter] - A callback that will be called
+     * when loading an asset that is contained in any of the bundles. It provides an array of
+     * bundles and will ensure asset is loaded from bundle returned from a callback. By default,
+     * the smallest filesize bundle is chosen.
+     * @example
+     * // load some assets
+     * const assetsToLoad = [
+     *     app.assets.find("My Asset"),
+     *     app.assets.find("Another Asset")
+     * ];
+     * let count = 0;
+     * assetsToLoad.forEach((assetToLoad) => {
+     *     assetToLoad.ready((asset) => {
+     *         count++;
+     *         if (count === assetsToLoad.length) {
+     *             // done
+     *         }
+     *     });
+     *     app.assets.load(assetToLoad);
+     * });
+     */
+    load(asset, options) {
+        // do nothing if asset is already loaded
+        // note: lots of code calls assets.load() assuming this check is present
+        // don't remove it without updating calls to assets.load() with checks for the asset.loaded state
+        if ((asset.loading || asset.loaded) && !options?.force) {
+            return;
+        }
+
+        const file = asset.file;
+
+        const _fireLoad = () => {
+            this.fire('load', asset);
+            this.fire(`load:${asset.id}`, asset);
+            if (file && file.url) {
+                this.fire(`load:url:${file.url}`, asset);
+            }
+            asset.fire('load', asset);
+        };
+
+        // open has completed on the resource
+        const _opened = (resource) => {
+            if (resource instanceof Array) {
+                asset.resources = resource;
+            } else {
+                asset.resource = resource;
+            }
+
+            // let handler patch the resource
+            this._loader.patch(asset, this);
+
+            if (asset.type === 'bundle') {
+                const assetIds = asset.data.assets;
+                for (let i = 0; i < assetIds.length; i++) {
+                    const assetInBundle = this._idToAsset.get(assetIds[i]);
+                    if (assetInBundle && !assetInBundle.loaded) {
+                        this.load(assetInBundle, { force: true });
+                    }
+                }
+
+                const bundle = /** @type {Bundle} */ (asset.resource);
+                if (bundle.loaded) {
+                    _fireLoad();
+                } else {
+                    this.fire('load:start', asset);
+                    this.fire(`load:start:${asset.id}`, asset);
+                    if (file && file.url) {
+                        this.fire(`load:start:url:${file.url}`, asset);
+                    }
+                    asset.fire('load:start', asset);
+                    bundle.on('load', _fireLoad);
+                }
+            } else {
+                _fireLoad();
+            }
+        };
+
+        // load has completed on the resource
+        const _loaded = (err, resource, extra) => {
+            asset.loaded = true;
+            asset.loading = false;
+
+            if (err) {
+                this.fire('error', err, asset);
+                this.fire(`error:${asset.id}`, err, asset);
+                asset.fire('error', err, asset);
+            } else {
+                // however it loaded, an earlier loadFromUrl failure no longer holds
+                asset.loadFromUrlError = null;
+
+                if (asset.type === 'script') {
+                    const handler = this._loader.getHandler('script');
+                    if (handler._cache[asset.id] && handler._cache[asset.id].parentNode === document.head) {
+                        // remove old element
+                        document.head.removeChild(handler._cache[asset.id]);
+                    }
+                    // prevents setting a null value in cache for esm scripts
+                    if (extra) {
+                        handler._cache[asset.id] = extra;
+                    }
+                }
+
+                _opened(resource);
+            }
+        };
+
+        if (file || asset.type === 'cubemap' || (asset.type === 'render' && asset.data.containerAsset)) {
+            // start loading the resource
+            this.fire('load:start', asset);
+            this.fire(`load:${asset.id}:start`, asset);
+
+            asset.loading = true;
+
+            const fileUrl = asset.getFileUrl();
+
+            // mark bundle assets as loading
+            if (asset.type === 'bundle') {
+                const assetIds = asset.data.assets;
+                for (let i = 0; i < assetIds.length; i++) {
+                    const assetInBundle = this._idToAsset.get(assetIds[i]);
+                    if (!assetInBundle) {
+                        continue;
+                    }
+
+                    if (assetInBundle.loaded || assetInBundle.resource || assetInBundle.loading) {
+                        continue;
+                    }
+
+                    assetInBundle.loading = true;
+                }
+            }
+
+
+            this._loader.load(fileUrl, asset.type, _loaded, asset, options);
+        } else {
+            // asset has no file to load, open it directly
+            const resource = this._loader.open(asset.type, asset.data);
+            asset.loaded = true;
+            _opened(resource);
+        }
+    }
+
+    /**
+     * Use this to load and create an asset if you don't have assets created. Usually you would
+     * only use this if you are not integrated with the PlayCanvas Editor.
+     *
+     * The `type` also types the loaded asset: `loadFromUrl(url, 'texture', callback)` passes an
+     * `Asset<'texture'>` to `callback`, whose `resource` is a {@link Texture}. See {@link AssetMap}.
+     * An asset already registered for the URL is reused, whatever its type, so load a URL as one
+     * type only; otherwise the callback can receive an asset of another type than requested.
+     *
+     * @template {AssetType | (string & {})} Type
+     * @param {string} url - The url to load.
+     * @param {Type} type - The type of asset to load (an {@link AssetType}).
+     * @param {LoadAssetCallback<Type>} callback - Function called when asset is loaded, passed (err,
+     * asset), where err is null if no errors were encountered.
+     * @example
+     * app.assets.loadFromUrl("../path/to/texture.jpg", "texture", function (err, asset) {
+     *     const texture = asset.resource; // a Texture
+     * });
+     */
+    loadFromUrl(url, type, callback) {
+        this.loadFromUrlAndFilename(url, null, type, callback);
+    }
+
+    /**
+     * Use this to load and create an asset when both the URL and filename are required. For
+     * example, use this function when loading BLOB assets, where the URL does not adequately
+     * identify the file.
+     *
+     * @template {AssetType | (string & {})} Type
+     * @param {string} url - The url to load.
+     * @param {string} filename - The filename of the asset to load.
+     * @param {Type} type - The type of asset to load (an {@link AssetType}).
+     * @param {LoadAssetCallback<Type>} callback - Function called when asset is loaded, passed (err,
+     * asset), where err is null if no errors were encountered.
+     * @example
+     * const file = magicallyObtainAFile();
+     * app.assets.loadFromUrlAndFilename(URL.createObjectURL(file), "texture.png", "texture", function (err, asset) {
+     *     const texture = asset.resource; // a Texture
+     * });
+     */
+    loadFromUrlAndFilename(url, filename, type, callback) {
+        const name = path.getBasename(filename || url);
+
+        const file = {
+            filename: filename || name,
+            url: url
+        };
+
+        // the URL index holds one asset per URL regardless of type, so this hands back whichever
+        // asset is registered for the URL; indexing by URL and type is tracked in #8489
+        let asset = /** @type {Asset<Type> | undefined} */ (this.getByUrl(url));
+        if (!asset) {
+            asset = new Asset(name, type, file);
+            this.add(asset);
+        } else if (asset.loaded) {
+            // asset is already loaded
+            callback(asset.loadFromUrlError || null, asset);
+            return;
+        }
+
+        const startLoad = (asset) => {
+            // the request's callback runs once: the load and the error listener remove each other,
+            // so a failed request's load listener does not run when the asset later loads
+            const onLoad = (loadedAsset) => {
+                asset.off('error', onError);
+                if (type === 'material') {
+                    this._loadTextures(loadedAsset, (err, textures) => {
+                        callback(err, loadedAsset);
+                    });
+                } else {
+                    callback(null, loadedAsset);
+                }
+            };
+            function onError(err) {
+                asset.off('load', onLoad);
+                // store the error on the asset in case user requests this asset again
+                if (err) {
+                    asset.loadFromUrlError = err;
+                }
+                callback(err, asset);
+            }
+            asset.once('load', onLoad);
+            asset.once('error', onError);
+            this.load(asset);
+        };
+
+        if (asset.resource) {
+            callback(null, asset);
+        } else if (type === 'model') {
+            this._loadModel(asset, startLoad);
+        } else {
+            startLoad(asset);
+        }
+    }
+
+    // private method used for engine-only loading of model data
+    _loadModel(modelAsset, continuation) {
+        const url = modelAsset.getFileUrl();
+        const ext = path.getExtension(url);
+
+        if (ext === '.json' || ext === '.glb') {
+            const dir = path.getDirectory(url);
+            const basename = path.getBasename(url);
+
+            // PlayCanvas model format supports material mapping file
+            const mappingUrl = path.join(dir, basename.replace(ext, '.mapping.json'));
+            this._loader.load(mappingUrl, 'json', (err, data) => {
+                if (err) {
+                    modelAsset.data = { mapping: [] };
+                    continuation(modelAsset);
+                } else {
+                    this._loadMaterials(modelAsset, data, (e, materials) => {
+                        modelAsset.data = data;
+                        continuation(modelAsset);
+                    });
+                }
+            });
+        } else {
+            // other model format (e.g. obj)
+            continuation(modelAsset);
+        }
+    }
+
+    // private method used for engine-only loading of model materials
+    _loadMaterials(modelAsset, mapping, callback) {
+        const materials = [];
+        let count = 0;
+
+        const onMaterialLoaded = (err, materialAsset) => {
+            // load dependent textures
+            this._loadTextures(materialAsset, (err, textures) => {
+                materials.push(materialAsset);
+                if (materials.length === count) {
+                    callback(null, materials);
+                }
+            });
+        };
+
+        for (let i = 0; i < mapping.mapping.length; i++) {
+            const path = mapping.mapping[i].path;
+            if (path) {
+                count++;
+                const url = modelAsset.getAbsoluteUrl(path);
+                this.loadFromUrl(url, 'material', onMaterialLoaded);
+            }
+        }
+
+        if (count === 0) {
+            callback(null, materials);
+        }
+    }
+
+    // private method used for engine-only loading of the textures referenced by
+    // the material asset
+    _loadTextures(materialAsset, callback) {
+        const textures = [];
+        let count = 0;
+
+        const data = materialAsset.data;
+        if (data.mappingFormat !== 'path') {
+            Debug.warn(`Skipping: ${materialAsset.name}, material files must be mappingFormat: "path" to be loaded from URL`);
+            callback(null, textures);
+            return;
+        }
+
+        const onTextureLoaded = (err, texture) => {
+            if (err) console.error(`Failed to load material texture for "${materialAsset.name}": ${err?.message ?? err}`, err);
+            textures.push(texture);
+            if (textures.length === count) {
+                callback(null, textures);
+            }
+        };
+
+        const texParams = standardMaterialTextureParameters;
+        for (let i = 0; i < texParams.length; i++) {
+            const path = data[texParams[i]];
+            if (path && typeof path === 'string') {
+                count++;
+                const url = materialAsset.getAbsoluteUrl(path);
+                this.loadFromUrl(url, 'texture', onTextureLoaded);
+            }
+        }
+
+        if (count === 0) {
+            callback(null, textures);
+        }
+    }
+
+    _onTagAdd(tag, asset) {
+        this._tags.add(tag, asset);
+    }
+
+    _onTagRemove(tag, asset) {
+        this._tags.remove(tag, asset);
+    }
+
+    _onNameChange(asset, name, nameOld) {
+        // remove
+        if (this._nameToAsset.has(nameOld)) {
+            const items = this._nameToAsset.get(nameOld);
+            items.delete(asset);
+            if (items.size === 0) {
+                this._nameToAsset.delete(nameOld);
+            }
+        }
+
+        // add
+        if (!this._nameToAsset.has(asset.name)) {
+            this._nameToAsset.set(asset.name, new Set());
+        }
+
+        this._nameToAsset.get(asset.name).add(asset);
+    }
+
+    /**
+     * Return all Assets that satisfy the search query. Query can be simply a string, or comma
+     * separated strings, to have inclusive results of assets that match at least one query. A
+     * query that consists of an array of tags can be used to match assets that have each tag of
+     * array.
+     *
+     * @param {...*} query - Name of a tag or array of tags.
+     * @returns {Asset[]} A list of all Assets matched query.
+     * @example
+     * const assets = app.assets.findByTag("level-1");
+     * // returns all assets that tagged by `level-1`
+     * @example
+     * const assets = app.assets.findByTag("level-1", "level-2");
+     * // returns all assets that tagged by `level-1` OR `level-2`
+     * @example
+     * const assets = app.assets.findByTag(["level-1", "monster"]);
+     * // returns all assets that tagged by `level-1` AND `monster`
+     * @example
+     * const assets = app.assets.findByTag(["level-1", "monster"], ["level-2", "monster"]);
+     * // returns all assets that tagged by (`level-1` AND `monster`) OR (`level-2` AND `monster`)
+     */
+    findByTag(...query) {
+        return this._tags.find(query);
+    }
+
+    /**
+     * Return all Assets that satisfy a filter callback.
+     *
+     * @param {FilterAssetCallback} callback - The callback function that is used to filter assets.
+     * Return `true` to include an asset in the returned array.
+     * @returns {Asset[]} A list of all Assets found.
+     * @example
+     * const assets = app.assets.filter(asset => asset.name.includes('monster'));
+     * console.log(`Found ${assets.length} assets with a name containing 'monster'`);
+     */
+    filter(callback) {
+        return Array.from(this._assets).filter(asset => callback(asset));
+    }
+
+    /**
+     * Return the first Asset with the specified name and type found in the registry.
+     *
+     * The `type` also types the result: `find('brick', 'texture')` returns
+     * `Asset<'texture'> | null`, whose `resource` is a {@link Texture}. See {@link AssetMap}.
+     *
+     * @template {AssetType | (string & {})} Type
+     * @overload
+     * @param {string} name - The name of the Asset to find.
+     * @param {Type} type - The type of the Asset to find (an {@link AssetType}).
+     * @returns {Asset<Type>|null} A single Asset or null if no Asset is found.
+     * @example
+     * const asset = app.assets.find("myTextureAsset", "texture");
+     * if (asset) {
+     *     const texture = asset.resource; // a Texture
+     * }
+     */
+    /**
+     * Return the first Asset with the specified name found in the registry, of any type or of a
+     * type only known as a `string`. The result is a plain `Asset`, whose `resource` is `unknown`.
+     *
+     * @overload
+     * @param {string} name - The name of the Asset to find.
+     * @param {string} [type] - The type of the Asset to find.
+     * @returns {Asset|null} A single Asset or null if no Asset is found.
+     * @example
+     * const asset = app.assets.find("myAsset");
+     */
+    /**
+     * @param {string} name - The name of the Asset to find.
+     * @param {string} [type] - The type of the Asset to find.
+     * @returns {Asset|null} A single Asset or null if no Asset is found.
+     */
+    find(name, type) {
+        const items = this._nameToAsset.get(name);
+        if (!items) return null;
+
+        for (const asset of items) {
+            if (!type || asset.type === type) {
+                return asset;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Return all Assets with the specified name and type found in the registry.
+     *
+     * The `type` also types the result, as for {@link AssetRegistry#find}:
+     * `findAll('brick', 'texture')` returns `Asset<'texture'>[]`.
+     *
+     * @template {AssetType | (string & {})} Type
+     * @overload
+     * @param {string} name - The name of the Assets to find.
+     * @param {Type} type - The type of the Assets to find (an {@link AssetType}).
+     * @returns {Asset<Type>[]} A list of all Assets found.
+     * @example
+     * const assets = app.assets.findAll('brick', 'texture');
+     * console.log(`Found ${assets.length} texture assets named 'brick'`);
+     * const textures = assets.map(asset => asset.resource); // Texture[]
+     */
+    /**
+     * Return all Assets with the specified name found in the registry, of any type or of a type
+     * only known as a `string`.
+     *
+     * @overload
+     * @param {string} name - The name of the Assets to find.
+     * @param {string} [type] - The type of the Assets to find.
+     * @returns {Asset[]} A list of all Assets found.
+     * @example
+     * const assets = app.assets.findAll('brick');
+     */
+    /**
+     * @param {string} name - The name of the Assets to find.
+     * @param {string} [type] - The type of the Assets to find.
+     * @returns {Asset[]} A list of all Assets found.
+     */
+    findAll(name, type) {
+        const items = this._nameToAsset.get(name);
+        if (!items) return [];
+        const results = Array.from(items);
+        if (!type) return results;
+        return results.filter(asset => asset.type === type);
+    }
+
+    /**
+     * Logs all assets in the registry to the console. Used for debugging with TRACEID_ASSETS.
+     *
+     * @ignore
+     */
+    log() {
+        // #if _DEBUG
+        if (!Tracing.get(TRACEID_ASSETS)) return;
+
+        const assets = this.list();
+        Debug.trace(TRACEID_ASSETS, `Assets: ${assets.length}`);
+
+        // Count by type and status
+        const byType = {};
+        let loadedCount = 0;
+        let loadingCount = 0;
+
+        assets.forEach((asset, index) => {
+            // Count by type
+            byType[asset.type] = (byType[asset.type] || 0) + 1;
+
+            // Count by status
+            if (asset.loaded) loadedCount++;
+            else if (asset.loading) loadingCount++;
+
+            // Determine status string
+            const status = asset.loaded ? 'loaded' : (asset.loading ? 'loading' : 'pending');
+
+            // Get URL (skip if same as name to avoid duplication)
+            const url = asset.file?.url;
+            const urlPart = (url && url !== asset.name) ? ` ${url}` : '';
+
+            Debug.trace(TRACEID_ASSETS, `${index}. ID:${asset.id} [${asset.type}] "${asset.name}" ${status}${urlPart}`);
+        });
+
+        // Log summary
+        const pendingCount = assets.length - loadedCount - loadingCount;
+        Debug.trace(TRACEID_ASSETS, `Status: ${loadedCount} loaded, ${loadingCount} loading, ${pendingCount} pending`);
+        Debug.trace(TRACEID_ASSETS, `Types: ${Object.entries(byType).map(([type, count]) => `${type}:${count}`).join(', ')}`);
+        // #endif
+    }
+
+    /**
+     * Retrieve an asset from the registry by its id.
+     *
+     * @param {number} id - The id of the asset to get.
+     * @returns {Asset|undefined} The asset.
+     * @ignore
+     * @deprecated Use {@link AssetRegistry#get} instead.
+     */
+    getAssetById(id) {
+        Debug.deprecated('AssetRegistry#getAssetById is deprecated. Use AssetRegistry#get instead.');
+        return this.get(id);
+    }
+}
+
+export { AssetRegistry };

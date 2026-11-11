@@ -1,0 +1,512 @@
+import { expect } from 'chai';
+import { restore, spy, stub } from 'sinon';
+
+import { AssetRegistry } from '../../../src/framework/asset/asset-registry.js';
+import { Asset } from '../../../src/framework/asset/asset.js';
+import { ResourceLoader } from '../../../src/framework/handlers/loader.js';
+import { GlbContainerResource } from '../../../src/framework/parsers/glb-container-resource.js';
+import { Texture } from '../../../src/platform/graphics/texture.js';
+import { http, Http } from '../../../src/platform/net/http.js';
+import { createApp } from '../../app.mjs';
+import { jsdomSetup, jsdomTeardown } from '../../jsdom.mjs';
+
+describe('AssetRegistry', function () {
+
+    let app;
+    let retryDelay;
+
+    beforeEach(function () {
+        jsdomSetup();
+        app = createApp();
+
+        retryDelay = Http.retryDelay;
+        Http.retryDelay = 1;
+    });
+
+    afterEach(function () {
+        Http.retryDelay = retryDelay;
+
+        app?.destroy();
+        app = null;
+        jsdomTeardown();
+        restore();
+    });
+
+    describe('#constructor', function () {
+
+        it('instantiates correctly', function () {
+            const resourceLoader = new ResourceLoader(app);
+            const assetRegistry = new AssetRegistry(resourceLoader);
+
+            expect(assetRegistry).to.be.ok;
+        });
+
+    });
+
+    describe('#add', function () {
+
+        it('adds an asset', function () {
+            const asset = new Asset('Test Asset', 'text', {
+                url: 'fake/url/file.txt'
+            });
+            app.assets.add(asset);
+
+            const assets = app.assets.list();
+            expect(assets.length).to.equal(1);
+            expect(assets[0].name).to.equal(asset.name);
+        });
+
+    });
+
+    describe('#find', function () {
+
+        it('works after removing an asset', function () {
+            const asset1 = new Asset('Asset 1', 'text', {
+                url: 'fake/one/file.txt'
+            });
+            const asset2 = new Asset('Asset 2', 'text', {
+                url: 'fake/two/file.txt'
+            });
+            const asset3 = new Asset('Asset 3', 'text', {
+                url: 'fake/three/file.txt'
+            });
+
+            app.assets.add(asset1);
+            app.assets.add(asset2);
+            app.assets.add(asset3);
+
+            app.assets.remove(asset1);
+
+            expect(app.assets.find(asset1.name)).to.equal(null);
+            expect(app.assets.find(asset2.name)).to.equal(asset2);
+            expect(app.assets.find(asset3.name)).to.equal(asset3);
+        });
+
+    });
+
+    describe('#find + rename', function () {
+
+        it('works after renaming an asset', function () {
+            const asset1 = new Asset('Asset 1', 'text', {
+                url: 'fake/one/file.txt'
+            });
+
+            app.assets.add(asset1);
+
+            asset1.name = 'Asset 1 renamed';
+
+            expect(app.assets.find('Asset 1')).to.equal(null);
+            expect(app.assets.find('Asset 1 renamed')).to.equal(asset1);
+
+            app.assets.remove(asset1);
+            asset1.name = 'Asset 1 renamed again';
+
+            expect(app.assets.find('Asset 1')).to.equal(null);
+            expect(app.assets.find('Asset 1 renamed')).to.equal(null);
+            expect(app.assets.find('Asset 1 renamed again')).to.equal(null);
+        });
+
+    });
+
+    describe('#find + type', function () {
+
+        it('finds assets by name filtered by type', function () {
+            const asset1 = new Asset('Asset 1', 'text', {
+                url: 'fake/one/file.txt'
+            });
+            const asset2 = new Asset('Asset 1', 'json', {
+                url: 'fake/two/file.json'
+            });
+
+            app.assets.add(asset1);
+            app.assets.add(asset2);
+
+            expect(app.assets.find('Asset 1', 'text')).to.equal(asset1);
+            expect(app.assets.find('Asset 1', 'json')).to.equal(asset2);
+        });
+
+    });
+
+    describe('#findAll + type', function () {
+
+        it('finds all assets by name filtered by type', function () {
+            const asset1 = new Asset('Asset 1', 'text', {
+                url: 'fake/one/file.txt'
+            });
+            const asset2 = new Asset('Asset 1', 'json', {
+                url: 'fake/two/file.json'
+            });
+            const asset3 = new Asset('Asset 1', 'text', {
+                url: 'fake/two/file.txt'
+            });
+            const asset4 = new Asset('Asset 1', 'text', {
+                url: 'fake/two/file.txt'
+            });
+
+            app.assets.add(asset1);
+            app.assets.add(asset2);
+            app.assets.add(asset3);
+            app.assets.add(asset4);
+
+            // ensure renaming updates indexes
+            asset3.name = 'Asset 1 renamed';
+
+            // ensure removing updates indexes
+            app.assets.remove(asset4);
+
+            expect(app.assets.findAll('Asset 1', 'text').length).to.equal(1);
+        });
+
+    });
+
+    describe('#get', function () {
+
+        it('retrieves an asset by id', function () {
+            const asset = new Asset('Test Asset', 'text', {
+                url: 'fake/url/file.txt'
+            });
+            app.assets.add(asset);
+
+            const assetFromRegistry = app.assets.get(asset.id);
+
+            expect(asset).to.equal(assetFromRegistry);
+        });
+
+    });
+
+    describe('#getByUrl', function () {
+
+        it('retrieves an asset by url', function () {
+            const asset = new Asset('Test Asset', 'text', {
+                url: 'fake/url/file.txt'
+            });
+            app.assets.add(asset);
+
+            const assetFromRegistry = app.assets.getByUrl(asset.file.url);
+
+            expect(asset).to.equal(assetFromRegistry);
+        });
+
+        it('works after removing an asset', function () {
+            const asset1 = new Asset('Asset 1', 'text', {
+                url: 'fake/one/file.txt'
+            });
+            const asset2 = new Asset('Asset 2', 'text', {
+                url: 'fake/two/file.txt'
+            });
+            const asset3 = new Asset('Asset 3', 'text', {
+                url: 'fake/three/file.txt'
+            });
+
+            app.assets.add(asset1);
+            app.assets.add(asset2);
+            app.assets.add(asset3);
+
+            app.assets.remove(asset1);
+
+            expect(app.assets.getByUrl(asset1.file.url)).to.equal(undefined);
+            expect(app.assets.getByUrl(asset2.file.url)).to.equal(asset2);
+            expect(app.assets.getByUrl(asset3.file.url)).to.equal(asset3);
+        });
+
+    });
+
+    describe('#list', function () {
+
+        it('lists all assets', function () {
+            const asset1 = new Asset('Asset 1', 'text', {
+                url: 'fake/one/file.txt'
+            });
+            const asset2 = new Asset('Asset 2', 'text', {
+                url: 'fake/two/file.txt'
+            });
+            const asset3 = new Asset('Asset 3', 'text', {
+                url: 'fake/three/file.txt'
+            });
+
+            app.assets.add(asset1);
+            app.assets.add(asset2);
+            app.assets.add(asset3);
+
+            const assets = app.assets.list();
+
+            expect(assets[0]).to.equal(asset1);
+            expect(assets[1]).to.equal(asset2);
+            expect(assets[2]).to.equal(asset3);
+        });
+
+    });
+
+    describe('#loadFromUrl', function () {
+
+        const assetPath = '/test/assets/';
+
+        it('loads binary assets', (done) => {
+            app.assets.loadFromUrl(`${assetPath}test.bin`, 'binary', (err, asset) => {
+                expect(err).to.be.null;
+                expect(asset).to.be.instanceof(Asset);
+                expect(asset.resource).to.be.instanceof(ArrayBuffer);
+                expect(asset.resource.byteLength).to.equal(8);
+                const bytes = new Uint8Array(asset.resource);
+                for (let i = 0; i < 8; i++) {
+                    expect(bytes[i]).to.equal(i);
+                }
+                done();
+            });
+        });
+
+        it('loads container assets', (done) => {
+            app.assets.loadFromUrl(`${assetPath}test.glb`, 'container', (err, asset) => {
+                expect(err).to.be.null;
+                expect(asset).to.be.instanceof(Asset);
+                expect(asset.resource).to.be.instanceof(GlbContainerResource);
+                done();
+            });
+        });
+
+        it('waits for GLB meshes before reporting a referenced render asset ready', async function () {
+            const container = new Asset('container', 'container', { url: `${assetPath}test.glb` });
+            const render = new Asset('render', 'render', null, {
+                containerAsset: container.id,
+                renderIndex: 0
+            });
+            app.assets.add(container);
+            app.assets.add(render);
+
+            const ready = new Promise((resolve, reject) => {
+                render.ready(resolve);
+                render.once('error', reject);
+            });
+            app.assets.load(render);
+            await ready;
+
+            expect(container.loaded).to.equal(true);
+            expect(render.resource.meshes).to.be.an('array').that.is.not.empty;
+            expect(render.resource.meshes).to.equal(container.resource.renders[0].resource.meshes);
+        });
+
+        it('supports retry loading of container assets', (done) => {
+            spy(http, 'request');
+            app.loader.enableRetry(2);
+            app.assets.loadFromUrl(`${assetPath}someurl.glb`, 'container', (err, asset) => {
+                expect(http.request.callCount).to.equal(3);
+                done();
+            });
+        });
+
+        it('reports a failed load again when its url is requested again', async () => {
+            const load = () => new Promise((resolve) => {
+                app.assets.loadFromUrl(`${assetPath}missing.glb`, 'container', (err, asset) => resolve({ err, asset }));
+            });
+            const first = await load();
+            expect(first.err).to.exist;
+            const again = await load();
+            expect(again.err).to.equal(first.err);
+            expect(again.asset.resource).to.not.exist;
+        });
+
+        it('reports a failed load no more once a forced reload succeeds', async () => {
+            // the first load fails, the forced reload after it succeeds
+            const load = stub(app.loader, 'load');
+            load.onFirstCall().callsFake((url, type, callback) => callback(404));
+            load.onSecondCall().callsFake((url, type, callback) => callback(null, 'reloaded'));
+
+            const url = `${assetPath}flaky.txt`;
+            const results = [];
+            const fromUrl = () => new Promise((resolve) => {
+                app.assets.loadFromUrl(url, 'text', (err, asset) => {
+                    results.push(err);
+                    resolve({ err, asset });
+                });
+            });
+            const first = await fromUrl();
+            expect(first.err).to.equal(404);
+
+            await new Promise((resolve) => {
+                first.asset.once('load', resolve);
+                app.assets.load(first.asset, { force: true });
+            });
+            // the failed request's load listener went with its error: its callback ran once
+            expect(results).to.deep.equal([404]);
+
+            const again = await fromUrl();
+            expect(again.err).to.be.null;
+            expect(again.asset.resource).to.equal('reloaded');
+        });
+
+        it('reports a failed load no more once the asset is unloaded', async () => {
+            // the first load fails, the load after unloading succeeds
+            const load = stub(app.loader, 'load');
+            load.onFirstCall().callsFake((url, type, callback) => callback(404));
+            load.onSecondCall().callsFake((url, type, callback) => callback(null, 'reloaded'));
+
+            const url = `${assetPath}flaky.txt`;
+            const fromUrl = () => new Promise((resolve) => {
+                app.assets.loadFromUrl(url, 'text', (err, asset) => resolve({ err, asset }));
+            });
+            const first = await fromUrl();
+            expect(first.err).to.equal(404);
+
+            first.asset.unload();
+            const again = await fromUrl();
+            expect(again.err).to.be.null;
+            expect(again.asset).to.equal(first.asset);
+            expect(again.asset.resource).to.equal('reloaded');
+        });
+
+        it('loads css assets', (done) => {
+            app.assets.loadFromUrl(`${assetPath}test.css`, 'css', (err, asset) => {
+                expect(err).to.be.null;
+                expect(asset).to.be.instanceof(Asset);
+                expect(asset.resource).to.be.a('string');
+                expect(asset.resource).to.equal('body { color: red }');
+                done();
+            });
+        });
+
+        it('loads html assets', (done) => {
+            app.assets.loadFromUrl(`${assetPath}test.html`, 'html', (err, asset) => {
+                expect(err).to.be.null;
+                expect(asset).to.be.instanceof(Asset);
+                expect(asset.resource).to.be.a('string');
+                done();
+            });
+        });
+
+        it('loads json assets', (done) => {
+            app.assets.loadFromUrl(`${assetPath}test.json`, 'json', (err, asset) => {
+                expect(err).to.be.null;
+                expect(asset).to.be.instanceof(Asset);
+                expect(asset.resource).to.be.an.instanceof(Object);
+                expect(asset.resource.a).to.equal(1);
+                expect(asset.resource.b).to.equal(true);
+                expect(asset.resource.c).to.equal('hello world');
+                done();
+            });
+        });
+
+        it('loads shader assets', (done) => {
+            app.assets.loadFromUrl(`${assetPath}test.glsl`, 'shader', (err, asset) => {
+                expect(err).to.be.null;
+                expect(asset).to.be.instanceof(Asset);
+                expect(asset.resource).to.be.a('string');
+                done();
+            });
+        });
+
+        it('loads text assets', (done) => {
+            app.assets.loadFromUrl(`${assetPath}test.txt`, 'text', (err, asset) => {
+                expect(err).to.be.null;
+                expect(asset).to.be.instanceof(Asset);
+                expect(asset.resource).to.be.a('string');
+                expect(asset.resource).to.equal('hello world');
+                done();
+            });
+        });
+
+        it('loads texture assets', (done) => {
+            app.assets.loadFromUrl(`${assetPath}test.png`, 'texture', (err, asset) => {
+                expect(err).to.be.null;
+                expect(asset).to.be.instanceof(Asset);
+                expect(asset.resource).to.be.instanceof(Texture);
+                done();
+            });
+        });
+
+    });
+
+    describe('#remove', function () {
+
+        it('removes by id', function () {
+            const asset1 = new Asset('Asset 1', 'text', {
+                url: 'fake/one/file.txt'
+            });
+            const asset2 = new Asset('Asset 2', 'text', {
+                url: 'fake/two/file.txt'
+            });
+            const asset3 = new Asset('Asset 3', 'text', {
+                url: 'fake/three/file.txt'
+            });
+
+            app.assets.add(asset1);
+            app.assets.add(asset2);
+            app.assets.add(asset3);
+
+            app.assets.remove(asset2);
+
+            const assets = app.assets.list();
+
+            expect(app.assets.get(asset1.id)).to.equal(asset1);
+            expect(app.assets.get(asset2.id)).to.equal(undefined);
+            expect(app.assets.get(asset3.id)).to.equal(asset3);
+
+            expect(app.assets.findAll(asset1.name)[0]).to.equal(asset1);
+            expect(app.assets.findAll(asset2.name).length).to.equal(0);
+            expect(app.assets.findAll(asset3.name)[0]).to.equal(asset3);
+
+            expect(assets[0].id).to.equal(asset1.id);
+            expect(assets[1].id).to.equal(asset3.id);
+        });
+
+    });
+
+    describe('#destroy', function () {
+
+        it('empties the registry and clears asset references to it', function () {
+            const asset = new Asset('Asset', 'text', {
+                url: 'fake/one/file.txt'
+            });
+            asset.tags.add('tag');
+
+            const registry = new AssetRegistry(new ResourceLoader(app));
+            registry.add(asset);
+            registry.destroy();
+
+            expect(registry.list().length).to.equal(0);
+            expect(registry.get(asset.id)).to.be.undefined;
+            expect(registry.getByUrl('fake/one/file.txt')).to.be.undefined;
+            expect(asset.registry).to.be.null;
+        });
+
+        it('unsubscribes from asset name and tag changes', function () {
+            const asset = new Asset('Asset', 'text', {
+                url: 'fake/one/file.txt'
+            });
+
+            const registry = new AssetRegistry(new ResourceLoader(app));
+            registry.add(asset);
+            registry.destroy();
+
+            // a still subscribed tag handler throws on the released tags cache, and a still
+            // subscribed name handler repopulates the name index
+            asset.tags.add('tag');
+            asset.tags.remove('tag');
+            asset.name = 'Renamed Asset';
+
+            expect(registry.find('Renamed Asset')).to.be.null;
+        });
+
+        it('leaves a registry reference which belongs to another registry', function () {
+            const asset = new Asset('Asset', 'text', {
+                url: 'fake/one/file.txt'
+            });
+
+            const registry = new AssetRegistry(new ResourceLoader(app));
+            registry.add(asset);
+
+            // the asset now belongs to the other registry, which is still live
+            const other = new AssetRegistry(new ResourceLoader(app));
+            other.add(asset);
+
+            registry.destroy();
+
+            expect(asset.registry).to.equal(other);
+            expect(other.get(asset.id)).to.equal(asset);
+
+            other.destroy();
+            expect(asset.registry).to.be.null;
+        });
+
+    });
+
+});

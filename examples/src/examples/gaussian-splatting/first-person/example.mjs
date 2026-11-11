@@ -1,0 +1,235 @@
+// @config
+//
+// `WASD` Move · `Space` Jump · `Mouse` Look
+//
+// @credit
+// title: Sunnyvale Heritage Park Museum
+// author: zeitgeistarchivescans
+// source: https://superspl.at/scene/d5d397aa
+// license: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+
+import {
+    AppBase,
+    AppOptions,
+    Asset,
+    AssetListLoader,
+    CameraComponentSystem,
+    CollisionComponentSystem,
+    Color,
+    ContainerHandler,
+    Entity,
+    FILLMODE_FILL_WINDOW,
+    GSPLAT_RENDERER_AUTO,
+    GSplatComponentSystem,
+    GSplatHandler,
+    GamePads,
+    Keyboard,
+    LightComponentSystem,
+    Mouse,
+    RESOLUTION_AUTO,
+    RenderComponentSystem,
+    RigidBodyComponentSystem,
+    ScriptComponentSystem,
+    ScriptHandler,
+    TONEMAP_LINEAR,
+    TextureHandler,
+    TouchDevice,
+    Vec3,
+    WasmModule,
+    createGraphicsDevice
+} from 'playcanvas';
+import { FirstPersonController } from 'playcanvas/scripts/esm/first-person-controller.mjs';
+
+import { data, deviceType } from 'examples/context';
+
+/**
+ * @import { RenderComponent } from 'playcanvas'
+ */
+
+const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('application-canvas'));
+window.focus();
+
+WasmModule.setConfig('Ammo', {
+    glueUrl: './assets/wasm/ammo/ammo.wasm.js',
+    wasmUrl: './assets/wasm/ammo/ammo.wasm.wasm',
+    fallbackUrl: './assets/wasm/ammo/ammo.js'
+});
+
+// The collision GLB uses Draco-compressed meshes, so the Draco decoder is required
+WasmModule.setConfig('DracoDecoderModule', {
+    glueUrl: './assets/wasm/draco/draco.wasm.js',
+    wasmUrl: './assets/wasm/draco/draco.wasm.wasm',
+    fallbackUrl: './assets/wasm/draco/draco.js'
+});
+
+await Promise.all([
+    new Promise((resolve) => {
+        WasmModule.getInstance('Ammo', () => resolve(true));
+    }),
+    new Promise((resolve) => {
+        WasmModule.getInstance('DracoDecoderModule', () => resolve(true));
+    })
+]);
+
+const gfxOptions = {
+    deviceTypes: [deviceType],
+
+    // Disable antialiasing as gaussian splats do not benefit from it and it's expensive
+    antialias: false
+};
+
+const device = await createGraphicsDevice(canvas, gfxOptions);
+device.maxPixelRatio = Math.min(window.devicePixelRatio, 2);
+
+const createOptions = new AppOptions();
+createOptions.graphicsDevice = device;
+createOptions.mouse = new Mouse(document.body);
+createOptions.touch = new TouchDevice(document.body);
+createOptions.gamepads = new GamePads();
+createOptions.keyboard = new Keyboard(window);
+
+createOptions.componentSystems = [
+    RenderComponentSystem,
+    CameraComponentSystem,
+    LightComponentSystem,
+    ScriptComponentSystem,
+    CollisionComponentSystem,
+    RigidBodyComponentSystem,
+    GSplatComponentSystem
+];
+createOptions.resourceHandlers = [TextureHandler, ContainerHandler, ScriptHandler, GSplatHandler];
+
+const app = new AppBase(canvas);
+app.init(createOptions);
+
+app.setCanvasFillMode(FILLMODE_FILL_WINDOW);
+app.setCanvasResolution(RESOLUTION_AUTO);
+
+// Ensure canvas is resized when window changes size
+const resize = () => app.resizeCanvas();
+window.addEventListener('resize', resize);
+app.on('destroy', () => {
+    window.removeEventListener('resize', resize);
+});
+
+const assets = {
+    splat: new Asset('sunnyvale-splat', 'gsplat', {
+        url: 'https://code.playcanvas.com/examples_data/example_sunnyvale/sunnyvale.sog'
+    }),
+    collision: new Asset('sunnyvale-collision', 'container', {
+        url: 'https://code.playcanvas.com/examples_data/example_sunnyvale/sunnyvale.glb'
+    })
+};
+
+await new Promise((resolve) => {
+    new AssetListLoader(Object.values(assets), app.assets).load(resolve);
+});
+
+app.start();
+
+// Renderer selection. Register before setting the initial value, so the initial
+// AUTO selection is resolved to the concrete renderer and shown in the dropdown.
+data.on('renderer:set', () => {
+    app.scene.gsplat.renderer = data.get('renderer');
+    const current = app.scene.gsplat.currentRenderer;
+    if (current !== data.get('renderer')) {
+        setTimeout(() => data.set('renderer', current), 0);
+    }
+});
+
+// Initial control values
+data.set('renderer', GSPLAT_RENDERER_AUTO);
+data.set('splatBudget', 4);
+data.set('data.stats.gsplats', '—');
+data.set('data.stats.resolution', '—');
+
+// Splat budget (in millions)
+const applySplatBudget = () => {
+    const millions = data.get('splatBudget');
+    app.scene.gsplat.splatBudget = Math.round(millions * 1000000);
+};
+applySplatBudget();
+data.on('splatBudget:set', applySplatBudget);
+
+// Gravity
+app.systems.rigidbody?.gravity.set(0, -10, 0);
+
+// Camera (attached to the character controller below)
+const camera = new Entity('camera');
+camera.addComponent('camera', {
+    clearColor: new Color(0.1, 0.1, 0.1),
+    farClip: 1000,
+    fov: 75,
+    toneMapping: TONEMAP_LINEAR
+});
+camera.setLocalPosition(0, 0.9, 0);
+
+// Parent that holds both the splat and the collision mesh, keeping them aligned.
+// The splat data is authored upside-down relative to PlayCanvas's Y-up convention,
+// so a 180° rotation around Z flips both the visual and the collision together.
+const sceneRoot = new Entity('sunnyvale');
+sceneRoot.setLocalEulerAngles(0, 0, 180);
+app.root.addChild(sceneRoot);
+
+// Gaussian splat (visual)
+const splat = new Entity('sunnyvale-gsplat');
+splat.addComponent('gsplat', {
+    asset: assets.splat
+});
+sceneRoot.addChild(splat);
+
+// Collision mesh instantiated from the GLB; attached to each render component as
+// a static rigidbody using the actual triangle mesh. The mesh itself is hidden -
+// it is only used for collision.
+const collisionRoot = assets.collision.resource.instantiateRenderEntity();
+collisionRoot.findComponents('render').forEach((/** @type {RenderComponent} */ render) => {
+    const entity = render.entity;
+    entity.addComponent('rigidbody', {
+        type: 'static',
+        friction: 0.5,
+        restitution: 0
+    });
+    entity.addComponent('collision', {
+        type: 'mesh',
+        renderAsset: render.asset
+    });
+    render.enabled = false;
+});
+sceneRoot.addChild(collisionRoot);
+
+// First-person character controller
+const characterController = new Entity('character-controller');
+characterController.setPosition(0, 2, 0);
+characterController.addChild(camera);
+characterController.addComponent('collision', {
+    type: 'capsule',
+    radius: 0.5,
+    height: 2
+});
+characterController.addComponent('rigidbody', {
+    type: 'dynamic',
+    mass: 100,
+    linearDamping: 0,
+    angularDamping: 0,
+    linearFactor: Vec3.ONE,
+    angularFactor: Vec3.ZERO,
+    friction: 0.5,
+    restitution: 0
+});
+characterController.addComponent('script');
+characterController.script.create(FirstPersonController, {
+    properties: {
+        camera,
+        jumpForce: 420,
+        speedGround: 65,
+        sprintMult: 1.73
+    }
+});
+app.root.addChild(characterController);
+
+// Stats
+app.on('update', () => {
+    data.set('data.stats.gsplats', app.stats.frame.gsplats.toLocaleString());
+    const bb = app.graphicsDevice.backBufferSize;
+    data.set('data.stats.resolution', `${bb.x} x ${bb.y}`);
+});

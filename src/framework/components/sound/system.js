@@ -1,0 +1,185 @@
+import { Debug } from '../../../core/debug.js';
+import { ComponentSystem } from '../system.js';
+import { SoundComponent } from './component.js';
+
+/**
+ * @import { AppBase } from '../../app-base.js'
+ * @import { Entity } from '../../entity.js'
+ * @import { SoundManager } from '../../../platform/sound/manager.js'
+ * @import { SoundSlot } from './slot.js'
+ */
+
+/**
+ * Options of the `sound` component accepted by {@link SoundComponentSystem} that differ from the
+ * properties of {@link SoundComponent}. Each replaces the same-named property of the options that
+ * {@link Entity#addComponent} derives from the component class; see
+ * {@link ComponentOptionsOverrides}.
+ *
+ * @typedef {object} SoundComponentOptionsOverrides
+ * @property {{ [name: string]: SoundSlot | { volume?: number, pitch?: number, loop?: boolean, startTime?: number, duration?: number, overlap?: boolean, autoPlay?: boolean, asset?: number } }} [slots] -
+ * Same as {@link SoundComponent#slots}, also accepting the plain {@link SoundSlot} settings of each
+ * slot.
+ * @ignore
+ */
+
+const _properties = [
+    'volume',
+    'pitch',
+    'positional',
+    'refDistance',
+    'maxDistance',
+    'rollOffFactor',
+    'distanceModel',
+    'slots'
+];
+
+/**
+ * Manages the {@link SoundComponent}s of an application. Reach it through `app.systems.sound`;
+ * components are created with {@link Entity#addComponent}, never by calling the system directly.
+ *
+ * @category Sound
+ */
+class SoundComponentSystem extends ComponentSystem {
+    /**
+     * Create a SoundComponentSystem.
+     *
+     * @param {AppBase} app - The Application.
+     * @ignore
+     */
+    constructor(app) {
+        super(app);
+
+        this.id = 'sound';
+
+        this.ComponentType = SoundComponent;
+
+        /**
+         * Gets / sets the sound manager.
+         *
+         * @type {SoundManager}
+         */
+        this.manager = app.soundManager;
+        Debug.assert(this.manager, 'SoundComponentSystem cannot be created without sound manager');
+
+        this.app.systems.on('update', this.onUpdate, this);
+
+        this.on('beforeremove', this.onBeforeRemove, this);
+    }
+
+    /**
+     * Sets the volume for the entire Sound system. All sounds will have their volume multiplied by
+     * this value. Valid range is between 0 and 1. Defaults to 1.
+     *
+     * @type {number}
+     */
+    set volume(volume) {
+        this.manager.volume = volume;
+    }
+
+    /**
+     * Gets the volume for the entire Sound system.
+     *
+     * @type {number}
+     */
+    get volume() {
+        return this.manager.volume;
+    }
+
+    /**
+     * Gets the AudioContext currently used by the sound manager.
+     *
+     * @type {AudioContext|null}
+     */
+    get context() {
+        return this.manager.context;
+    }
+
+    initializeComponentData(component, data) {
+        for (let i = 0; i < _properties.length; i++) {
+            if (data.hasOwnProperty(_properties[i])) {
+                component[_properties[i]] = data[_properties[i]];
+            }
+        }
+
+        super.initializeComponentData(component, data);
+    }
+
+    cloneComponent(entity, clone) {
+        const c = entity.sound;
+
+        const data = {
+            enabled: c.enabled
+        };
+
+        for (let i = 0; i < _properties.length; i++) {
+            const property = _properties[i];
+            if (property === 'slots') {
+                // convert 'slots' back to simple option objects
+                const slots = {};
+                for (const key in c.slots) {
+                    const srcSlot = c.slots[key];
+                    slots[key] = {
+                        name: srcSlot.name,
+                        volume: srcSlot.volume,
+                        pitch: srcSlot.pitch,
+                        loop: srcSlot.loop,
+                        duration: srcSlot.duration,
+                        startTime: srcSlot.startTime,
+                        overlap: srcSlot.overlap,
+                        autoPlay: srcSlot.autoPlay,
+                        asset: srcSlot.asset
+                    };
+                }
+                data.slots = slots;
+            } else {
+                data[property] = c[property];
+            }
+        }
+
+        return this.addComponent(clone, data);
+    }
+
+    onUpdate(dt) {
+        const store = this.store;
+
+        for (const id in store) {
+            if (store.hasOwnProperty(id)) {
+                const item = store[id];
+                const entity = item.entity;
+
+                if (entity.enabled) {
+                    const component = entity.sound;
+
+                    // Update slot position if this is a 3d sound
+                    if (component.enabled && component.positional) {
+                        const position = entity.getPosition();
+                        const slots = component.slots;
+                        for (const key in slots) {
+                            slots[key].updatePosition(position);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    onBeforeRemove(entity, component) {
+        const slots = component.slots;
+        // stop non overlapping sounds
+        for (const key in slots) {
+            if (!slots[key].overlap) {
+                slots[key].stop();
+            }
+        }
+
+        component.onBeforeRemove();
+    }
+
+    destroy() {
+        super.destroy();
+
+        this.app.systems.off('update', this.onUpdate, this);
+    }
+}
+
+export { SoundComponentSystem };

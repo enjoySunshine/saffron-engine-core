@@ -1,0 +1,139 @@
+export default /* glsl */`
+#ifdef GSPLAT_USER_VARYINGS
+    #include "gsplatUserVaryingsVS"
+#endif
+#include "gsplatCommonVS"
+
+varying mediump vec2 gaussianUV;
+flat varying mediump vec4 gaussianColor;
+
+#ifndef DITHER_NONE
+    flat varying float id;
+#endif
+
+mediump vec4 discardVec = vec4(0.0, 0.0, 2.0, 1.0);
+
+#if defined(PREPASS_PASS) || defined(SCENE_TEXTURE_DEPTH)
+    flat varying float vLinearDepth;
+#endif
+
+#if defined(GSPLAT_UNIFIED_ID) && defined(PICK_PASS)
+    flat varying uint vPickId;
+#endif
+
+#ifdef GSPLAT_OVERDRAW
+    uniform sampler2D colorRamp;
+    uniform float colorRampIntensity;
+#endif
+
+void main(void) {
+    // read gaussian details
+    SplatSource source;
+    if (!initSource(source)) {
+        gl_Position = discardVec;
+        return;
+    }
+
+    vec3 modelCenter = getCenter();
+
+    SplatCenter center;
+    center.modelCenterOriginal = modelCenter;
+    
+    modifySplatCenter(modelCenter);
+    center.modelCenterModified = modelCenter;
+
+    if (!initCenter(modelCenter, center)) {
+        gl_Position = discardVec;
+        return;
+    }
+
+    // project center to screen space
+    SplatCorner corner;
+    if (!initCorner(source, center, corner)) {
+        gl_Position = discardVec;
+        return;
+    }
+
+    // read color
+    #ifdef GSPLAT_SEPARATE_OPACITY
+        float opacity = getOpacity(); // must run before getColor() to cache color data
+        vec4 clr = vec4(getColor(), opacity);
+    #else
+        vec4 clr = getColor();
+    #endif
+
+    #if GSPLAT_AA
+        // apply AA compensation
+        clr.a *= corner.aaFactor;
+    #endif
+
+    // evaluate spherical harmonics
+    #if SH_BANDS > 0
+        // calculate the model-space view direction. Orthographic view rays are all parallel to the
+        // camera forward, rather than running from the camera position to the splat.
+        vec3 viewDir = camera_params.w == 1.0 ? vec3(0.0, 0.0, -1.0) : center.view;
+        vec3 dir = normalize(viewDir * mat3(center.modelView));
+
+        // read sh coefficients
+        vec3 sh[SH_COEFFS];
+        float scale;
+        readSHData(sh, scale);
+
+        // evaluate
+        clr.xyz += evalSH(sh, dir) * scale;
+    #endif
+
+    modifySplatColor(modelCenter, clr);
+
+    // discard splats with alpha too low to contribute any visible pixel (threshold matches frag pass)
+    #if defined(SHADOW_PASS) || defined(PICK_PASS) || defined(PREPASS_PASS)
+        float alphaClipValue = alphaClip;
+    #else
+        float alphaClipValue = alphaClipForward;
+    #endif
+    if (clr.w <= alphaClipValue) {
+        gl_Position = discardVec;
+        return;
+    }
+
+    clipCorner(corner, clr.w);
+
+    // over-unity opacity (see gsplatHelpersVS): above 1, the alpha passed to the fragment shader is
+    // 1 + the core radius instead, drawn with peak alpha 1
+    if (clr.w > 1.0) {
+        clr.w = 1.0 + gsplatPlateauCore(clr.w);
+    }
+
+    // write output
+    #if GSPLAT_2DGS
+        // 2DGS: Project world corner directly
+        vec3 modelCorner = center.modelCenterModified + corner.offset;
+        gl_Position = matrix_projection * center.modelView * vec4(modelCorner, 1.0);
+    #else
+        gl_Position = center.proj + vec4(corner.offset.xyz, 0);
+    #endif
+    gaussianUV = corner.uv;
+
+    #ifdef GSPLAT_OVERDRAW
+        // Overdraw visualization mode: color by elevation
+        float t = clamp(modelCenter.y / 20.0, 0.0, 1.0);
+        vec3 rampColor = textureLod(colorRamp, vec2(t, 0.5), 0.0).rgb;
+        clr.a = min(clr.a, 1.0) * (1.0 / 32.0) * colorRampIntensity;
+        gaussianColor = vec4(rampColor, clr.a);
+    #else
+        gaussianColor = vec4(prepareOutputFromGamma(max(clr.xyz, 0.0), -center.view.z), clr.w);
+    #endif
+
+    #ifndef DITHER_NONE
+        id = float(splat.index);
+    #endif
+
+    #if defined(PREPASS_PASS) || defined(SCENE_TEXTURE_DEPTH)
+        vLinearDepth = -center.view.z;
+    #endif
+
+    #if defined(GSPLAT_UNIFIED_ID) && defined(PICK_PASS)
+        vPickId = loadPcId().r;
+    #endif
+}
+`;

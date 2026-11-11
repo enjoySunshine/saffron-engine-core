@@ -1,0 +1,130 @@
+import {
+    ASPECT_AUTO,
+    AppBase,
+    AppOptions,
+    Asset,
+    AssetListLoader,
+    CameraComponentSystem,
+    ContainerHandler,
+    FILLMODE_FILL_WINDOW,
+    LightComponentSystem,
+    RESOLUTION_AUTO,
+    RenderComponentSystem,
+    TextureHandler,
+    createGraphicsDevice
+} from 'playcanvas';
+
+import { deviceType } from 'examples/context';
+
+/**
+ * @import { CameraComponent, LightComponent } from 'playcanvas'
+ */
+
+// The example demonstrates loading multiple assets from a single bundle file
+
+// This tar file has been created by a command line:
+// : cd engine/examples/
+// : tar cvf assets/bundles/bundle.tar assets/models/geometry-camera-light.glb assets/models/torus.png
+
+const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('application-canvas'));
+window.focus();
+
+const assets = {
+    bundle: new Asset('bundle', 'bundle', { url: './assets/bundles/bundle.tar' }),
+    scene: new Asset('scene', 'container', { url: './assets/models/geometry-camera-light.glb' }),
+    torus: new Asset('torus', 'container', { url: './assets/models/torus.glb' })
+};
+
+// Bundle should list asset IDs in its data
+assets.bundle.data = { assets: [assets.scene.id, assets.torus.id] };
+
+const gfxOptions = {
+    deviceTypes: [deviceType]
+};
+
+const device = await createGraphicsDevice(canvas, gfxOptions);
+device.maxPixelRatio = Math.min(window.devicePixelRatio, 2);
+
+const createOptions = new AppOptions();
+createOptions.graphicsDevice = device;
+
+createOptions.componentSystems = [RenderComponentSystem, CameraComponentSystem, LightComponentSystem];
+createOptions.resourceHandlers = [TextureHandler, ContainerHandler];
+
+const app = new AppBase(canvas);
+app.init(createOptions);
+
+// Set the canvas to fill the window and automatically change resolution to be the same as the canvas size
+app.setCanvasFillMode(FILLMODE_FILL_WINDOW);
+app.setCanvasResolution(RESOLUTION_AUTO);
+
+// Ensure canvas is resized when window changes size
+const resize = () => app.resizeCanvas();
+window.addEventListener('resize', resize);
+app.on('destroy', () => {
+    window.removeEventListener('resize', resize);
+});
+
+// Load assets
+// Notice that scene and torus are loaded as blob's and only tar file is downloaded
+await new Promise((resolve) => {
+    new AssetListLoader(Object.values(assets), app.assets).load(resolve);
+});
+
+app.start();
+
+/**
+ * the array will store loaded cameras
+ * @type {CameraComponent[]}
+ */
+let camerasComponents = null;
+
+// glb lights use physical units
+app.scene.physicalUnits = true;
+
+// Create an instance using render component
+const entity = assets.scene.resource.instantiateRenderEntity();
+app.root.addChild(entity);
+
+// Create an instance using render component
+const entityTorus = assets.torus.resource.instantiateRenderEntity();
+app.root.addChild(entityTorus);
+entityTorus.setLocalPosition(0, 0, 2);
+
+// Find all cameras - by default they are disabled
+camerasComponents = entity.findComponents('camera');
+camerasComponents.forEach((component) => {
+    // Set the aspect ratio to automatic to work with any window size
+    component.aspectRatioMode = ASPECT_AUTO;
+
+    // Set up exposure for physical units
+    component.aperture = 4;
+    component.shutter = 1 / 100;
+    component.sensitivity = 500;
+});
+
+/** @type {LightComponent[]} */
+const lightComponents = entity.findComponents('light');
+lightComponents.forEach((component) => {
+    component.enabled = true;
+});
+
+let time = 0;
+let activeCamera = 0;
+app.on('update', (dt) => {
+    time -= dt;
+
+    entityTorus.rotateLocal(360 * dt, 0, 0);
+
+    // Change the camera every few seconds
+    if (time <= 0) {
+        time = 2;
+
+        // Disable current camera
+        camerasComponents[activeCamera].enabled = false;
+
+        // Activate next camera
+        activeCamera = (activeCamera + 1) % camerasComponents.length;
+        camerasComponents[activeCamera].enabled = true;
+    }
+});

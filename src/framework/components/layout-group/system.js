@@ -1,0 +1,150 @@
+import { Vec2 } from '../../../core/math/vec2.js';
+import { Vec4 } from '../../../core/math/vec4.js';
+import { ComponentSystem } from '../system.js';
+import { LayoutGroupComponent } from './component.js';
+
+/**
+ * @import { AppBase } from '../../app-base.js'
+ * @import { Entity } from '../../entity.js'
+ */
+
+/**
+ * Options of the `layoutgroup` component accepted by {@link LayoutGroupComponentSystem} that differ
+ * from the properties of {@link LayoutGroupComponent}. Each replaces the same-named property of the
+ * options that {@link Entity#addComponent} derives from the component class; see
+ * {@link ComponentOptionsOverrides}.
+ *
+ * @typedef {object} LayoutGroupComponentOptionsOverrides
+ * @property {Vec2 | number[]} [alignment] - Same as {@link LayoutGroupComponent#alignment}, also
+ * accepting an `[x, y]` array.
+ * @property {Vec4 | number[]} [padding] - Same as {@link LayoutGroupComponent#padding}, also
+ * accepting an `[x, y, z, w]` array.
+ * @property {Vec2 | number[]} [spacing] - Same as {@link LayoutGroupComponent#spacing}, also
+ * accepting an `[x, y]` array.
+ * @ignore
+ */
+
+const MAX_ITERATIONS = 100;
+
+/**
+ * Manages the {@link LayoutGroupComponent}s of an application. Reach it through
+ * `app.systems.layoutgroup`; components are created with {@link Entity#addComponent}, never by
+ * calling the system directly.
+ *
+ * @category User Interface
+ */
+class LayoutGroupComponentSystem extends ComponentSystem {
+    /**
+     * Create a new LayoutGroupComponentSystem instance.
+     *
+     * @param {AppBase} app - The application.
+     * @ignore
+     */
+    constructor(app) {
+        super(app);
+
+        this.id = 'layoutgroup';
+
+        this.ComponentType = LayoutGroupComponent;
+
+        this._reflowQueue = [];
+
+        this.on('beforeremove', this.onBeforeRemove, this);
+
+        // Perform reflow when running in the engine
+        this.app.systems.on('postUpdate', this._onPostUpdate, this);
+    }
+
+    initializeComponentData(component, data, properties) {
+        if (data.enabled !== undefined) component.enabled = data.enabled;
+        if (data.orientation !== undefined) component.orientation = data.orientation;
+        if (data.reverseX !== undefined) component.reverseX = data.reverseX;
+        if (data.reverseY !== undefined) component.reverseY = data.reverseY;
+        if (data.alignment !== undefined) {
+            component.alignment = Array.isArray(data.alignment) ? new Vec2(data.alignment) : data.alignment;
+        }
+        if (data.padding !== undefined) {
+            component.padding = Array.isArray(data.padding) ? new Vec4(data.padding) : data.padding;
+        }
+        if (data.spacing !== undefined) {
+            component.spacing = Array.isArray(data.spacing) ? new Vec2(data.spacing) : data.spacing;
+        }
+        if (data.widthFitting !== undefined) component.widthFitting = data.widthFitting;
+        if (data.heightFitting !== undefined) component.heightFitting = data.heightFitting;
+        if (data.wrap !== undefined) component.wrap = data.wrap;
+
+        // pass an empty properties list as the enabled state is initialized above
+        super.initializeComponentData(component, data, []);
+    }
+
+    cloneComponent(entity, clone) {
+        const layoutGroup = entity.layoutgroup;
+
+        return this.addComponent(clone, {
+            enabled: layoutGroup.enabled,
+            orientation: layoutGroup.orientation,
+            reverseX: layoutGroup.reverseX,
+            reverseY: layoutGroup.reverseY,
+            alignment: layoutGroup.alignment,
+            padding: layoutGroup.padding,
+            spacing: layoutGroup.spacing,
+            widthFitting: layoutGroup.widthFitting,
+            heightFitting: layoutGroup.heightFitting,
+            wrap: layoutGroup.wrap
+        });
+    }
+
+    scheduleReflow(component) {
+        if (this._reflowQueue.indexOf(component) === -1) {
+            this._reflowQueue.push(component);
+        }
+    }
+
+    _onPostUpdate() {
+        this._processReflowQueue();
+    }
+
+    _processReflowQueue() {
+        if (this._reflowQueue.length === 0) {
+            return;
+        }
+
+        let iterationCount = 0;
+
+        while (this._reflowQueue.length > 0) {
+            // Create a copy of the queue to sort and process. If processing the reflow of any
+            // layout groups results in additional groups being pushed to the queue, they will
+            // be processed on the next iteration of the while loop.
+            const queue = this._reflowQueue.slice();
+            this._reflowQueue.length = 0;
+
+            // Sort in ascending order of depth within the graph (i.e. outermost first), so that
+            // any layout groups which are children of other layout groups will always have their
+            // new size set before their own reflow is calculated.
+            queue.sort((componentA, componentB) => {
+                return (componentA.entity.graphDepth - componentB.entity.graphDepth);
+            });
+
+            for (let i = 0; i < queue.length; ++i) {
+                queue[i].reflow();
+            }
+
+            if (++iterationCount >= MAX_ITERATIONS) {
+                console.warn('Max reflow iterations limit reached, bailing.');
+                break;
+            }
+        }
+    }
+
+    onBeforeRemove(entity, component) {
+        component.onBeforeRemove();
+    }
+
+    destroy() {
+        super.destroy();
+
+        this.app.systems.off('postUpdate', this._onPostUpdate, this);
+    }
+}
+
+export { LayoutGroupComponentSystem };

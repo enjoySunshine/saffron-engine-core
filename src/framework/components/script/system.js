@@ -1,0 +1,249 @@
+import { SortedLoopArray } from '../../../core/sorted-loop-array.js';
+import { ComponentSystem } from '../system.js';
+import { ScriptComponent } from './component.js';
+
+/**
+ * @import { AppBase } from '../../app-base.js'
+ * @import { Entity } from '../../entity.js'
+ */
+
+/**
+ * Options of the `script` component accepted by {@link ScriptComponentSystem} that differ from the
+ * properties of {@link ScriptComponent}. Each replaces the same-named property of the options that
+ * {@link Entity#addComponent} derives from the component class; see
+ * {@link ComponentOptionsOverrides}.
+ *
+ * @typedef {object} ScriptComponentOptionsOverrides
+ * @property {string[]} [order] - Names of the scripts to create, in execution order. Used together
+ * with `scripts`.
+ * @property {{ [name: string]: { enabled?: boolean, attributes?: object } }} [scripts] -
+ * Initialization of each script to create, keyed by script name: its `enabled` state and
+ * `attributes` values. Used together with `order`.
+ * @ignore
+ */
+
+const METHOD_INITIALIZE_ATTRIBUTES = '_onInitializeAttributes';
+const METHOD_INITIALIZE = '_onInitialize';
+const METHOD_POST_INITIALIZE = '_onPostInitialize';
+const METHOD_UPDATE = '_onUpdate';
+const METHOD_POST_UPDATE = '_onPostUpdate';
+
+// Ever-increasing integer used as the execution order of new script components. We are using an
+// ever-increasing number and not the order of the script component in the components array because
+// if we ever remove components from the array, we would have to re-calculate the execution order
+// for all subsequent script components in the array every time, which would be slow.
+let executionOrderCounter = 0;
+
+/**
+ * Manages the {@link ScriptComponent}s of an application. Reach it through `app.systems.script`;
+ * components are created with {@link Entity#addComponent}, never by calling the system directly.
+ *
+ * @category Script
+ */
+class ScriptComponentSystem extends ComponentSystem {
+    /**
+     * Create a new ScriptComponentSystem.
+     *
+     * @param {AppBase} app - The application.
+     * @ignore
+     */
+    constructor(app) {
+        super(app);
+
+        this.id = 'script';
+
+        this.ComponentType = ScriptComponent;
+
+        // 'order' is consumed alongside 'scripts' in initializeComponentData, it is not a component property
+        this.extraDataProperties = ['order'];
+
+        // list of all entities script components
+        // we are using SortedLoopArray because it is
+        // safe to modify while looping through it
+        this._components = new SortedLoopArray({
+            sortBy: '_executionOrder'
+        });
+
+        // holds all the enabled script components
+        // (whose entities are also enabled). We are using SortedLoopArray
+        // because it is safe to modify while looping through it. This array often
+        // change during update and postUpdate loops as entities and components get
+        // enabled or disabled
+        this._enabledComponents = new SortedLoopArray({
+            sortBy: '_executionOrder'
+        });
+
+
+        // if true then we are currently preloading scripts
+        this.preloading = true;
+
+        this.on('beforeremove', this.onBeforeRemove, this);
+        this.app.systems.on('initialize', this._onInitialize, this);
+        this.app.systems.on('postInitialize', this._onPostInitialize, this);
+        this.app.systems.on('update', this._onUpdate, this);
+        this.app.systems.on('postUpdate', this._onPostUpdate, this);
+    }
+
+    initializeComponentData(component, data) {
+        // Set execution order to an ever-increasing number
+        // and add to the end of the components array.
+        component._executionOrder = executionOrderCounter++;
+        this._components.append(component);
+
+        // check we don't overflow executionOrderCounter
+        if (executionOrderCounter > Number.MAX_SAFE_INTEGER) {
+            this._resetExecutionOrder();
+        }
+
+        component.enabled = data.hasOwnProperty('enabled') ? !!data.enabled : true;
+        // if enabled then add this component to the end of the enabledComponents array
+        // Note, we should be OK to just append this to the end instead of using insert()
+        // which will search for the right slot to insert the component based on execution order,
+        // because the execution order of this script should be larger than all the others in the
+        // enabledComponents array since it was just added.
+        if (component.enabled && component.entity.enabled) {
+            this._enabledComponents.append(component);
+        }
+
+        if (data.hasOwnProperty('order') && data.hasOwnProperty('scripts')) {
+            component._scriptsData = data.scripts;
+
+            for (let i = 0; i < data.order.length; i++) {
+                component.create(data.order[i], {
+                    enabled: data.scripts[data.order[i]].enabled,
+                    attributes: data.scripts[data.order[i]].attributes,
+                    preloading: this.preloading
+                });
+            }
+        }
+    }
+
+    cloneComponent(entity, clone) {
+        const order = [];
+        const scripts = { };
+
+        for (let i = 0; i < entity.script._scripts.length; i++) {
+            const scriptInstance = entity.script._scripts[i];
+            const scriptName = scriptInstance.__scriptType.__name;
+            order.push(scriptName);
+
+            // copy, the map holds the source component's own attribute data
+            const attributes = { ...entity.script._attributeDataMap?.get(scriptName) };
+            for (const key in scriptInstance.__attributes) {
+                attributes[key] = scriptInstance.__attributes[key];
+            }
+
+            scripts[scriptName] = {
+                enabled: scriptInstance._enabled,
+                attributes: attributes
+            };
+        }
+
+        // scripts still awaiting their script type to be added to the registry have no instance
+        // to read from, so restore them from the data they were declared with. Their entry in
+        // `scripts` is required, otherwise initializeComponentData throws when it looks up the
+        // name coming from `order`.
+        let previousName = null;
+        for (const scriptName of entity.script._declarationOrder) {
+            const indexData = entity.script._scriptsIndex[scriptName];
+
+            // scripts that have an instance are already in `order`
+            if (!indexData?.awaiting) {
+                if (indexData?.instance) previousName = scriptName;
+                continue;
+            }
+
+            // place the script directly after the one it was declared after, which is where the
+            // deferred creation in ScriptRegistry#add will put it on the source entity
+            const ind = previousName === null ? 0 : order.indexOf(previousName) + 1;
+            order.splice(ind, 0, scriptName);
+            previousName = scriptName;
+
+            // the same declaration the deferred creation will read on the source entity
+            scripts[scriptName] = {
+                enabled: indexData.enabled,
+                attributes: { ...indexData.attributes }
+            };
+        }
+
+        const data = {
+            enabled: entity.script.enabled,
+            order: order,
+            scripts: scripts
+        };
+
+        return this.addComponent(clone, data);
+    }
+
+    _resetExecutionOrder() {
+        executionOrderCounter = 0;
+        for (let i = 0, len = this._components.length; i < len; i++) {
+            this._components.items[i]._executionOrder = executionOrderCounter++;
+        }
+    }
+
+    _callComponentMethod(components, name, dt) {
+        for (components.loopIndex = 0; components.loopIndex < components.length; components.loopIndex++) {
+            components.items[components.loopIndex][name](dt);
+        }
+    }
+
+    _onInitialize() {
+        this.preloading = false;
+
+        // initialize attributes on all components
+        this._callComponentMethod(this._components, METHOD_INITIALIZE_ATTRIBUTES);
+
+        // call onInitialize on enabled components
+        this._callComponentMethod(this._enabledComponents, METHOD_INITIALIZE);
+    }
+
+    _onPostInitialize() {
+        // call onPostInitialize on enabled components
+        this._callComponentMethod(this._enabledComponents, METHOD_POST_INITIALIZE);
+    }
+
+    _onUpdate(dt) {
+        // call onUpdate on enabled components
+        this._callComponentMethod(this._enabledComponents, METHOD_UPDATE, dt);
+    }
+
+    _onPostUpdate(dt) {
+        // call onPostUpdate on enabled components
+        this._callComponentMethod(this._enabledComponents, METHOD_POST_UPDATE, dt);
+    }
+
+    // inserts the component into the enabledComponents array
+    // which finds the right slot based on component._executionOrder
+    _addComponentToEnabled(component) {
+        this._enabledComponents.insert(component);
+    }
+
+    // removes the component from the enabledComponents array
+    _removeComponentFromEnabled(component) {
+        this._enabledComponents.remove(component);
+    }
+
+    onBeforeRemove(entity, component) {
+        const ind = this._components.items.indexOf(component);
+        if (ind >= 0) {
+            component.onBeforeRemove();
+        }
+
+        this._removeComponentFromEnabled(component);
+
+        // remove from components array
+        this._components.remove(component);
+    }
+
+    destroy() {
+        super.destroy();
+
+        this.app.systems.off('initialize', this._onInitialize, this);
+        this.app.systems.off('postInitialize', this._onPostInitialize, this);
+        this.app.systems.off('update', this._onUpdate, this);
+        this.app.systems.off('postUpdate', this._onPostUpdate, this);
+    }
+}
+
+export { ScriptComponentSystem };

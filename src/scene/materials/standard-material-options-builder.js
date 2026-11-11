@@ -1,0 +1,413 @@
+import {
+    PIXELFORMAT_DXT5, PIXELFORMAT_RGBA8, TEXTURETYPE_SWIZZLEGGGR
+} from '../../platform/graphics/constants.js';
+
+import {
+    BLEND_NONE,
+    MASK_AFFECT_DYNAMIC,
+    SHADER_PREPASS,
+    SHADERDEF_DIRLM, SHADERDEF_INSTANCING, SHADERDEF_LM, SHADERDEF_MORPH_POSITION, SHADERDEF_MORPH_NORMAL, SHADERDEF_NOSHADOW,
+    SHADERDEF_SCREENSPACE, SHADERDEF_SKIN, SHADERDEF_TANGENTS, SHADERDEF_VCOLOR, SHADERDEF_LMAMBIENT,
+    TONEMAP_NONE,
+    DITHER_NONE,
+    PARALLAX_OCCLUSION,
+    PARALLAX_OFFSET,
+    SHADERDEF_MORPH_TEXTURE_BASED_INT, SHADERDEF_BATCH, SHADERDEF_CLIP,
+    FOG_NONE,
+    REFLECTIONSRC_NONE, REFLECTIONSRC_ENVATLAS, REFLECTIONSRC_ENVATLASHQ, REFLECTIONSRC_CUBEMAP, REFLECTIONSRC_SPHEREMAP,
+    REFLECTIONSRC_PLANAR,
+    AMBIENTSRC_AMBIENTSH, AMBIENTSRC_ENVALATLAS, AMBIENTSRC_CONSTANT,
+    SCENETEXTURE_DEPTH
+} from '../constants.js';
+import { _matTex2D } from '../shader-lib/programs/standard.js';
+import { LitMaterialOptionsBuilder } from './lit-material-options-builder.js';
+import { shaderDefsToLightMask } from '../light-mask.js';
+
+const notBlack = (color) => {
+    return color.r !== 0 || color.g !== 0 || color.b !== 0;
+};
+
+class StandardMaterialOptionsBuilder {
+    // Minimal options for Depth and Shadow passes, and the outline pass
+    updateMinRef(options, scene, stdMat, objDefs, pass, lightList, vertexFormat, outlinePass = false) {
+        this._updateSharedOptions(options, scene, stdMat, objDefs, pass);
+        this._updateMinOptions(options, stdMat, pass, outlinePass);
+        this._updateUVOptions(options, stdMat, objDefs, vertexFormat, true);
+    }
+
+    updateRef(options, scene, cameraShaderParams, stdMat, objDefs, pass, lightList, vertexFormat) {
+        this._updateSharedOptions(options, scene, stdMat, objDefs, pass, cameraShaderParams);
+        this._updateEnvOptions(options, stdMat, scene, cameraShaderParams);
+        this._updateMaterialOptions(options, stdMat, scene);
+        options.litOptions.hasTangents = objDefs && ((objDefs & SHADERDEF_TANGENTS) !== 0);
+        this._updateLightOptions(options, scene, stdMat, objDefs, lightList);
+        this._updateUVOptions(options, stdMat, objDefs, vertexFormat, false, cameraShaderParams);
+    }
+
+    _updateSharedOptions(options, scene, stdMat, objDefs, pass, cameraShaderParams) {
+        options.forceUv1 = stdMat.forceUv1;
+
+        // linear depth is rendered by the prepass, and by the forward pass when the camera renders
+        // the scene depth into a scene texture. Note that the minimal variant of the options, used
+        // by the prepass among others, is built without the camera shader params
+        options.litOptions.linearDepth = pass === SHADER_PREPASS ||
+            !!cameraShaderParams?.sceneTextures.includes(SCENETEXTURE_DEPTH);
+
+        // USER ATTRIBUTES
+        if (stdMat.userAttributes) {
+            options.litOptions.userAttributes = Object.fromEntries(stdMat.userAttributes.entries());
+        }
+
+        options.litOptions.shaderChunks = stdMat.shaderChunks;
+        options.litOptions.pass = pass;
+        options.litOptions.alphaTest = stdMat.alphaTest > 0;
+        options.litOptions.blendType = stdMat.blendType;
+
+        options.litOptions.screenSpace = objDefs && (objDefs & SHADERDEF_SCREENSPACE) !== 0;
+        options.litOptions.skin = objDefs && (objDefs & SHADERDEF_SKIN) !== 0;
+        options.litOptions.batch = objDefs && (objDefs & SHADERDEF_BATCH) !== 0;
+        options.litOptions.useInstancing = objDefs && (objDefs & SHADERDEF_INSTANCING) !== 0;
+        options.litOptions.useMorphPosition = objDefs && (objDefs & SHADERDEF_MORPH_POSITION) !== 0;
+        options.litOptions.useMorphNormal = objDefs && (objDefs & SHADERDEF_MORPH_NORMAL) !== 0;
+        options.litOptions.useMorphTextureBasedInt = objDefs && (objDefs & SHADERDEF_MORPH_TEXTURE_BASED_INT) !== 0;
+        options.litOptions.useClipPlanes = objDefs && (objDefs & SHADERDEF_CLIP) !== 0;
+
+        options.litOptions.nineSlicedMode = stdMat.nineSlicedMode || 0;
+
+        // clustered lighting features (in shared options as shadow pass needs this too)
+        if (scene.clusteredLightingEnabled && stdMat.useLighting) {
+            options.litOptions.clusteredLightingEnabled = true;
+            options.litOptions.clusteredLightingCookiesEnabled = scene.lighting.cookiesEnabled;
+            options.litOptions.clusteredLightingShadowsEnabled = scene.lighting.shadowsEnabled;
+            options.litOptions.clusteredLightingShadowType = scene.lighting.shadowType;
+            // area light shapes the shaders support, none when area lights are disabled
+            const areaLightShapes = scene.lighting.areaLightShapes;
+            options.litOptions.clusteredLightingAreaLightsEnabled = areaLightShapes !== 0;
+            options.litOptions.clusteredLightingAreaLightShapes = areaLightShapes;
+        } else {
+            options.litOptions.clusteredLightingEnabled = false;
+            options.litOptions.clusteredLightingCookiesEnabled = false;
+            options.litOptions.clusteredLightingShadowsEnabled = false;
+            options.litOptions.clusteredLightingAreaLightsEnabled = false;
+            options.litOptions.clusteredLightingAreaLightShapes = 0;
+        }
+    }
+
+    _updateUVOptions(options, stdMat, objDefs, vertexFormat, minimalOptions, cameraShaderParams) {
+        const hasVcolor = (objDefs & SHADERDEF_VCOLOR) !== 0;
+
+        options.litOptions.vertexColors = false;
+
+        // the map which claims the sampler of each assigned map, which is what the bind group of
+        // the material declares its texture slots with
+        const textureIdentifiers = stdMat.textureIdentifiers;
+        for (const p of _matTex2D.keys()) {
+            this._updateTexOptions(options, stdMat, p, vertexFormat, hasVcolor, minimalOptions, textureIdentifiers);
+        }
+
+        // true if ssao is applied directly in the lit shaders. Also ensure the AO part is generated in the front end
+        options.litOptions.ssao = cameraShaderParams?.ssaoEnabled;
+        options.useAO = options.litOptions.ssao;
+
+        // All texture related lit options
+        options.litOptions.lightMapEnabled = options.lightMap || options.lightVertexColor;
+        options.litOptions.dirLightMapEnabled = options.dirLightMap;
+        options.litOptions.useHeights = options.heightMap;
+
+        // the parallax mode only matters when a height map is assigned
+        options.parallaxMode = options.heightMap ? stdMat.parallaxMode : PARALLAX_OFFSET;
+
+        // self shadowing marches the height field, so it needs the marched mode - the tap count
+        // doubles as the switch, as alphaTest does above
+        options.parallaxSelfShadow = options.parallaxMode === PARALLAX_OCCLUSION && stdMat.parallaxShadowSamples > 0;
+        options.litOptions.useNormals = options.normalMap;
+        options.litOptions.useClearCoatNormals = options.clearCoatNormalMap;
+        options.litOptions.useAo = options.aoMap || options.aoVertexColor || options.litOptions.ssao;
+    }
+
+    _updateTexOptions(options, stdMat, p, vertexFormat, hasVcolor, minimalOptions, textureIdentifiers) {
+        const isOpacity = p === 'opacity';
+
+        if (!minimalOptions || isOpacity) {
+            const mname = `${p}Map`;
+            const vname = `${p}VertexColor`;
+            const vcname = `${p}VertexColorChannel`;
+            const cname = `${mname}Channel`;
+            const tname = `${mname}Transform`;
+            const uname = `${mname}Uv`;
+            const iname = `${mname}Identifier`;
+
+            // a lightmap supplied by the mesh instance takes priority over the material's own, so
+            // the material's lightmap and its uv set, channel and transform are all skipped. Its
+            // vertex color lightmap still applies, as that is a separate source.
+            const skipMap = p === 'light' && options.useInstanceLightMap;
+
+            // Avoid overriding previous lightMap properties
+            if (p !== 'light') {
+                options[mname] = false;
+                options[iname] = undefined;
+                options[cname] = '';
+                options[tname] = 0;
+                options[uname] = 0;
+            }
+            options[vname] = false;
+            options[vcname] = '';
+
+            if (isOpacity && stdMat.blendType === BLEND_NONE && stdMat.alphaTest === 0.0 && !stdMat.alphaToCoverage && stdMat.opacityDither === DITHER_NONE) {
+                return;
+            }
+
+            if (p !== 'height' && stdMat[vname]) {
+                if (hasVcolor) {
+                    options[vname] = stdMat[vname];
+                    options[vcname] = stdMat[vcname];
+                    options.litOptions.vertexColors = true;
+                }
+            }
+            // a map is only sampled when the mesh provides the uv set it is assigned to
+            if (!skipMap && stdMat[mname] && vertexFormat?.hasUv(stdMat[uname])) {
+
+                // maps pointing at one texture share the sampler of whichever of them claimed it,
+                // which is the slot the bind group of the material holds that texture in
+                options[mname] = !!stdMat[mname];
+                options[iname] = textureIdentifiers.get(p) ?? p;
+                options[tname] = stdMat._getMapTransformId(p);
+                options[cname] = stdMat[cname];
+                options[uname] = stdMat[uname];
+            }
+        }
+    }
+
+    _updateMinOptions(options, stdMat, pass, outlinePass) {
+
+        // pre-pass uses the same dither setting as forward pass, otherwise shadow dither
+        const isPrepass = pass === SHADER_PREPASS;
+        options.litOptions.opacityShadowDither = isPrepass ? stdMat.opacityDither : stdMat.opacityShadowDither;
+
+        options.litOptions.lights = [];
+
+        // the outline pass is a forward pass which outputs the outline color, so it skips the
+        // clustered lighting too, and outputs an alpha of 1 with the opacity used by the alpha
+        // test only. Both are set by the shared options on every call, so they do not leak into
+        // the other minimal passes.
+        if (outlinePass) {
+            options.litOptions.blendType = BLEND_NONE;
+            options.litOptions.clusteredLightingEnabled = false;
+            options.litOptions.clusteredLightingCookiesEnabled = false;
+            options.litOptions.clusteredLightingShadowsEnabled = false;
+            options.litOptions.clusteredLightingAreaLightsEnabled = false;
+        }
+    }
+
+    _updateMaterialOptions(options, stdMat, scene) {
+        const useSpecular = !!(stdMat.useMetalness || stdMat.specularMap || stdMat.sphereMap || stdMat.cubeMap ||
+                            stdMat.planarReflectionMap ||
+                            notBlack(stdMat.specular) || (stdMat.specularityFactor > 0 && stdMat.useMetalness) ||
+                            stdMat.enableGGXSpecular ||
+                            (stdMat.clearCoat > 0));
+
+        const useSpecularColor = (!stdMat.useMetalness || stdMat.useMetalnessSpecularColor);
+
+        // the specularity factor constant is always applied with the metalness specular color
+        const specularityFactorTint = useSpecular && stdMat.useMetalnessSpecularColor;
+
+        const isPackedNormalMap = texture => (texture ? (texture.format === PIXELFORMAT_DXT5 || texture.type === TEXTURETYPE_SWIZZLEGGGR) : false);
+
+        // these constants are always applied, so that a material with their neutral value (such as
+        // a metalness or refraction of 1, or an index of refraction of 1 / 1.5) shares the shader of
+        // one with any other value, and a change of them never recompiles. Folding the neutral value
+        // into the shader would save only an instruction or two.
+        options.metalnessTint = stdMat.useMetalness;
+        options.glossTint = true;
+        options.iorTint = true;
+        options.refractionTint = true;
+        options.thicknessTint = true;
+        options.iridescenceTint = true;
+        options.specularityFactorTint = specularityFactorTint;
+
+        options.diffuseEncoding = stdMat.diffuseMap?.encoding;
+        options.diffuseDetailEncoding = stdMat.diffuseDetailMap?.encoding;
+        options.emissiveEncoding = stdMat.emissiveMap?.encoding;
+        options.lightMapEncoding = stdMat.lightMap?.encoding;
+        options.packedNormal = isPackedNormalMap(stdMat.normalMap);
+        options.specularEncoding = stdMat.specularMap?.encoding;
+        options.sheenEncoding = stdMat.sheenMap?.encoding;
+        options.diffuseTransmissionColorEncoding = stdMat.diffuseTransmissionColorMap?.encoding;
+        options.aoDetail = !!stdMat.aoDetailMap;
+        options.diffuseDetail = !!stdMat.diffuseDetailMap;
+        options.normalDetail = !!stdMat.normalMap;
+        options.normalDetailPackedNormal = isPackedNormalMap(stdMat.normalDetailMap);
+        options.diffuseDetailMode = stdMat.diffuseDetailMode;
+        options.aoDetailMode = stdMat.aoDetailMode;
+        options.clearCoatPackedNormal = isPackedNormalMap(stdMat.clearCoatNormalMap);
+
+        options.glossInvert = stdMat.glossInvert;
+        options.sheenGlossInvert = stdMat.sheenGlossInvert;
+        options.clearCoatGlossInvert = stdMat.clearCoatGlossInvert;
+
+        options.useSpecularColor = useSpecularColor;
+
+        // LIT OPTIONS
+        options.litOptions.separateAmbient = false;    // store ambient light color in separate variable, instead of adding it to diffuse directly
+        options.litOptions.pixelSnap = stdMat.pixelSnap;
+
+        options.litOptions.ambientSH = !!stdMat.ambientSH;
+        options.litOptions.occludeSpecular = stdMat.occludeSpecular;
+        // the intensity is always applied, so that an intensity of 1 shares the shader of a lower one
+        options.litOptions.occludeSpecularFloat = true;
+
+        options.litOptions.useMsdf = !!stdMat.msdfMap;
+        options.litOptions.msdfTextAttribute = !!stdMat.msdfTextAttribute;
+
+        options.litOptions.alphaToCoverage = stdMat.alphaToCoverage;
+        options.litOptions.opacityFadesSpecular = stdMat.opacityFadesSpecular;
+        options.litOptions.opacityDither = stdMat.opacityDither;
+
+        options.litOptions.cubeMapProjection = stdMat.cubeMapProjection;
+
+        options.litOptions.useSpecular = useSpecular;
+        options.litOptions.useSpecularityFactor = (specularityFactorTint || !!stdMat.specularityFactorMap) && stdMat.useMetalnessSpecularColor;
+        options.litOptions.enableGGXSpecular = stdMat.enableGGXSpecular;
+        options.litOptions.useAnisotropy = stdMat.enableGGXSpecular && (stdMat.anisotropyIntensity > 0 || !!stdMat.anisotropyMap);
+        options.litOptions.fresnelModel = stdMat.fresnelModel;
+        // the refraction without the scene color samples the reflections with the refracted ray,
+        // which a planar reflection, holding only the mirrored scene, cannot provide
+        const reflectionSource = options.litOptions.reflectionSource;
+        const useCubeRefraction = reflectionSource !== REFLECTIONSRC_NONE && reflectionSource !== REFLECTIONSRC_PLANAR;
+        options.litOptions.useRefraction = (stdMat.refraction || !!stdMat.refractionMap) && (stdMat.useDynamicRefraction || useCubeRefraction);
+        options.litOptions.useClearCoat = !!stdMat.clearCoat;
+        options.litOptions.useSheen = stdMat.useSheen;
+        options.litOptions.useIridescence = stdMat.useIridescence && stdMat.iridescence !== 0.0;
+        options.litOptions.useDiffuseTransmission = stdMat.diffuseTransmission > 0;
+        options.litOptions.useMetalness = stdMat.useMetalness;
+        options.litOptions.useDynamicRefraction = stdMat.useDynamicRefraction;
+        options.litOptions.dispersion = stdMat.dispersion > 0;
+        options.litOptions.shadowCatcher = stdMat.shadowCatcher;
+
+        options.litOptions.useVertexColorGamma = stdMat.vertexColorGamma;
+    }
+
+    _updateEnvOptions(options, stdMat, scene, cameraShaderParams) {
+        options.litOptions.fog = stdMat.useFog ? cameraShaderParams.fog : FOG_NONE;
+        options.litOptions.gamma = cameraShaderParams.shaderOutputGamma;
+        options.litOptions.toneMap = stdMat.useTonemap ? cameraShaderParams.toneMapping : TONEMAP_NONE;
+
+        // A material environment texture replaces the scene environment for every role (reflections,
+        // ambient, refraction); the scene environment is used only when the material has none.
+        const useSceneEnv = stdMat.useSkybox && !stdMat.envAtlas && !stdMat.cubeMap && !stdMat.sphereMap;
+        let usingSceneEnv = false;
+
+        // source of environment reflections is as follows, a planar reflection replacing only the
+        // reflections, while the environment still provides the ambient lighting:
+        if (stdMat.planarReflectionMap) {
+            options.litOptions.reflectionSource = REFLECTIONSRC_PLANAR;
+            options.litOptions.reflectionEncoding = stdMat.planarReflectionMap.encoding;
+        } else if (stdMat.envAtlas && stdMat.cubeMap) {
+            options.litOptions.reflectionSource = REFLECTIONSRC_ENVATLASHQ;
+            options.litOptions.reflectionEncoding = stdMat.envAtlas.encoding;
+            options.litOptions.reflectionCubemapEncoding = stdMat.cubeMap.encoding;
+        } else if (stdMat.envAtlas) {
+            options.litOptions.reflectionSource = REFLECTIONSRC_ENVATLAS;
+            options.litOptions.reflectionEncoding = stdMat.envAtlas.encoding;
+        } else if (stdMat.cubeMap) {
+            options.litOptions.reflectionSource = REFLECTIONSRC_CUBEMAP;
+            options.litOptions.reflectionEncoding = stdMat.cubeMap.encoding;
+        } else if (stdMat.sphereMap) {
+            options.litOptions.reflectionSource = REFLECTIONSRC_SPHEREMAP;
+            options.litOptions.reflectionEncoding = stdMat.sphereMap.encoding;
+        } else if (useSceneEnv && scene.envAtlas && scene.skybox) {
+            options.litOptions.reflectionSource = REFLECTIONSRC_ENVATLASHQ;
+            options.litOptions.reflectionEncoding = scene.envAtlas.encoding;
+            options.litOptions.reflectionCubemapEncoding = scene.skybox.encoding;
+            usingSceneEnv = true;
+        } else if (useSceneEnv && scene.envAtlas) {
+            options.litOptions.reflectionSource = REFLECTIONSRC_ENVATLAS;
+            options.litOptions.reflectionEncoding = scene.envAtlas.encoding;
+            usingSceneEnv = true;
+        } else if (useSceneEnv && scene.skybox) {
+            options.litOptions.reflectionSource = REFLECTIONSRC_CUBEMAP;
+            options.litOptions.reflectionEncoding = scene.skybox.encoding;
+            usingSceneEnv = true;
+        } else {
+            options.litOptions.reflectionSource = REFLECTIONSRC_NONE;
+            options.litOptions.reflectionEncoding = null;
+        }
+
+        // source of environment ambient is as follows:
+        if (stdMat.ambientSH) {
+            options.litOptions.ambientSource = AMBIENTSRC_AMBIENTSH;
+            options.litOptions.ambientEncoding = null;
+        } else {
+            const envAtlas = stdMat.envAtlas || (useSceneEnv ? scene.envAtlas : null);
+            if (envAtlas) {
+                options.litOptions.ambientSource = AMBIENTSRC_ENVALATLAS;
+                options.litOptions.ambientEncoding = envAtlas.encoding;
+
+                // the ambient lighting alone can use the scene environment, when a planar
+                // reflection replaces the reflections
+                usingSceneEnv ||= envAtlas !== stdMat.envAtlas;
+            } else {
+                options.litOptions.ambientSource = AMBIENTSRC_CONSTANT;
+                options.litOptions.ambientEncoding = null;
+            }
+        }
+
+        // TODO: add a test for if non skybox cubemaps have rotation (when this is supported) - for now assume no non-skybox cubemap rotation
+        options.litOptions.skyboxIntensity = usingSceneEnv;
+        options.litOptions.useCubeMapRotation = usingSceneEnv && scene._skyboxRotationShaderInclude;
+
+        // the environment chunks sample either the scene or the material textures, which use different uniforms
+        options.litOptions.useSceneEnv = usingSceneEnv;
+    }
+
+    _updateLightOptions(options, scene, stdMat, objDefs, lightList) {
+        options.lightMap = false;
+        options.lightMapChannel = '';
+        options.lightMapUv = 0;
+        options.lightMapTransform = 0;
+        options.lightMapIdentifier = undefined;
+        options.useInstanceLightMap = false;
+        options.litOptions.lightMapWithoutAmbient = false;
+        options.dirLightMap = false;
+
+        if (objDefs) {
+            options.litOptions.noShadow = (objDefs & SHADERDEF_NOSHADOW) !== 0;
+
+            if ((objDefs & SHADERDEF_LM) !== 0) {
+
+                // the mesh instance supplies the lightmap, in its own texture slot, and takes
+                // priority over a lightmap assigned to the material
+                options.lightMapEncoding = scene.lightmapPixelFormat === PIXELFORMAT_RGBA8 ? 'rgbm' : 'linear';
+                options.lightMap = true;
+                options.lightMapChannel = 'rgb';
+                options.lightMapUv = 1;
+                options.lightMapTransform = 0;
+                options.useInstanceLightMap = true;
+                if ((objDefs & SHADERDEF_DIRLM) !== 0) {
+                    options.dirLightMap = true;
+                }
+
+                // a baked lightmap only contains the ambient light when it was baked with it, so
+                // otherwise the ambient light is still applied at runtime
+                options.litOptions.lightMapWithoutAmbient = (objDefs & SHADERDEF_LMAMBIENT) === 0;
+            }
+        }
+
+        if (stdMat.useLighting) {
+            const mask = objDefs ? shaderDefsToLightMask(objDefs) : MASK_AFFECT_DYNAMIC;
+
+            // mask to select lights (dynamic vs lightmapped) when using clustered lighting
+            options.litOptions.lightMaskDynamic = !!(mask & MASK_AFFECT_DYNAMIC);
+
+            options.litOptions.lights = LitMaterialOptionsBuilder.selectLights(lightList, mask);
+        } else {
+            options.litOptions.lights = [];
+        }
+
+        if (options.litOptions.lights.length === 0 && !scene.clusteredLightingEnabled) {
+            options.litOptions.noShadow = true;
+        }
+    }
+}
+
+export { StandardMaterialOptionsBuilder };

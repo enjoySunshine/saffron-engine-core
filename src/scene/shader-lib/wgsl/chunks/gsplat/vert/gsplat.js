@@ -1,0 +1,158 @@
+export default /* wgsl */`
+#ifdef GSPLAT_USER_VARYINGS
+    #include "gsplatUserVaryingsVS"
+#endif
+#include "gsplatCommonVS"
+
+varying gaussianUV: half2;
+varying @interpolate(flat, either) gaussianColor: half4;
+
+#ifndef DITHER_NONE
+    varying @interpolate(flat, either) id: f32;
+#endif
+
+const discardVec: vec4f = vec4f(0.0, 0.0, 2.0, 1.0);
+
+#if defined(PREPASS_PASS) || defined(SCENE_TEXTURE_DEPTH)
+    varying @interpolate(flat, either) vLinearDepth: f32;
+#endif
+
+#if defined(GSPLAT_UNIFIED_ID) && defined(PICK_PASS)
+    varying @interpolate(flat, either) vPickId: u32;
+#endif
+
+#ifdef GSPLAT_OVERDRAW
+    uniform colorRampIntensity: f32;
+    var colorRamp: texture_2d<f32>;
+    var colorRampSampler: sampler;
+#endif
+
+@vertex
+fn vertexMain(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+
+    // read gaussian details
+    var source: SplatSource;
+    if (!initSource(&source)) {
+        output.position = discardVec;
+        return output;
+    }
+
+    var modelCenter: vec3f = getCenter();
+
+    var center: SplatCenter;
+    center.modelCenterOriginal = modelCenter;
+    
+    modifySplatCenter(&modelCenter);
+    center.modelCenterModified = modelCenter;
+
+    if (!initCenter(modelCenter, &center)) {
+        output.position = discardVec;
+        return output;
+    }
+
+    // project center to screen space
+    var corner: SplatCorner;
+    if (!initCorner(&source, &center, &corner)) {
+        output.position = discardVec;
+        return output;
+    }
+
+    // read color (~11 bit source data, use half precision)
+    #ifdef GSPLAT_SEPARATE_OPACITY
+        let opacity = getOpacity(); // must run before getColor() to cache color data
+        var clr: half4 = half4(vec4f(getColor(), opacity));
+    #else
+        var clr: half4 = half4(getColor());
+    #endif
+
+    #if GSPLAT_AA
+        clr.a = clr.a * corner.aaFactor;
+    #endif
+
+    // evaluate spherical harmonics
+    #if SH_BANDS > 0
+        // calculate the model-space view direction. Orthographic view rays are all parallel to the
+        // camera forward, rather than running from the camera position to the splat.
+        // Firefox on Windows (D3D12) returns a transposed matrix when a struct member is indexed
+        // through a pointer, so load the whole matrix into a local first. Remove the local once the
+        // fix has shipped: https://bugzilla.mozilla.org/show_bug.cgi?id=2059727
+        let modelView = center.modelView;
+        let modelView3x3 = mat3x3f(modelView[0].xyz, modelView[1].xyz, modelView[2].xyz);
+        let viewDir = select(center.view, vec3f(0.0, 0.0, -1.0), uniform.camera_params.w == 1.0);
+        let dir = normalize(viewDir * modelView3x3);
+
+        // read sh coefficients
+        var sh: array<half3, SH_COEFFS>;
+        var scale: f32;
+        readSHData(&sh, &scale);
+
+        // evaluate (SH coefficients and result are half precision)
+        clr = half4(clr.xyz + evalSH(&sh, dir) * half(scale), clr.a);
+    #endif
+
+    // user hook operates in f32
+    var clrF32 = vec4f(clr);
+    modifySplatColor(modelCenter, &clrF32);
+    clr = half4(clrF32);
+
+    // discard splats with alpha too low (threshold matches fragment pass)
+    #if defined(SHADOW_PASS) || defined(PICK_PASS) || defined(PREPASS_PASS)
+        let alphaClipValue = half(uniform.alphaClip);
+    #else
+        let alphaClipValue = half(uniform.alphaClipForward);
+    #endif
+    if (clr.w <= alphaClipValue) {
+        output.position = discardVec;
+        return output;
+    }
+
+    clipCorner(&corner, clr.w);
+
+    // over-unity opacity (see gsplatHelpersVS): above 1, the alpha passed to the fragment shader is
+    // 1 + the core radius instead, drawn with peak alpha 1
+    if (clr.w > half(1.0)) {
+        clr.w = half(1.0 + gsplatPlateauCore(f32(clr.w)));
+    }
+
+    // write output
+    #if GSPLAT_2DGS
+        // 2DGS: Project world corner directly
+        let modelCorner: vec3f = center.modelCenterModified + corner.offset;
+        output.position = uniform.matrix_projection * center.modelView * vec4f(modelCorner, 1.0);
+    #else
+        // 3DGS: Add clip-space offset to projected center
+        output.position = center.proj + vec4f(corner.offset.xyz, 0.0);
+    #endif
+    output.gaussianUV = corner.uv;
+
+    // copy user varying values (written by the modify functions) to the outputs
+    #ifdef GSPLAT_USER_VARYINGS
+        #include "gsplatUserVaryingsFlushVS"
+    #endif
+
+    #ifdef GSPLAT_OVERDRAW
+        // Overdraw visualization mode: color by elevation
+        let t: f32 = clamp(center.modelCenterOriginal.y / 20.0, 0.0, 1.0);
+        let rampColor: vec3f = textureSampleLevel(colorRamp, colorRampSampler, vec2f(t, 0.5), 0.0).rgb;
+        clr.a = min(clr.a, half(1.0)) * half(1.0 / 32.0) * half(uniform.colorRampIntensity);
+        output.gaussianColor = half4(half3(rampColor), clr.a);
+    #else
+        output.gaussianColor = half4(half3(prepareOutputFromGamma(max(vec3f(clr.xyz), vec3f(0.0)), -center.view.z)), clr.w);
+    #endif
+
+    #ifndef DITHER_NONE
+        output.id = f32(splat.index);
+    #endif
+
+    #if defined(PREPASS_PASS) || defined(SCENE_TEXTURE_DEPTH)
+        output.vLinearDepth = -center.view.z;
+    #endif
+
+    #if defined(GSPLAT_UNIFIED_ID) && defined(PICK_PASS)
+        output.vPickId = loadPcId().r;
+    #endif
+
+    return output;
+}
+`;

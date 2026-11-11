@@ -1,0 +1,180 @@
+import { path } from '../../core/path.js';
+import { string } from '../../core/string.js';
+import { FILTER_LINEAR } from '../../platform/graphics/constants.js';
+import { http } from '../../platform/net/http.js';
+import { Asset } from '../asset/asset.js';
+import { FONT_MSDF } from '../font/constants.js';
+import { Font } from '../font/font.js';
+import { ResourceHandler } from './handler.js';
+
+/**
+ * @import { AppBase } from '../app-base.js'
+ */
+
+function upgradeDataSchema(data) {
+    // convert v1 and v2 to v3 font data schema
+    if (data.version < 3) {
+        if (data.version < 2) {
+            data.info.maps = data.info.maps || [{
+                width: data.info.width,
+                height: data.info.height
+            }];
+        }
+        data.chars = Object.keys(data.chars || {}).reduce((newChars, key) => {
+            const existing = data.chars[key];
+            // key by letter instead of char code
+            const newKey = existing.letter !== undefined ? existing.letter : string.fromCodePoint(key);
+            if (data.version < 2) {
+                existing.map = existing.map || 0;
+            }
+            newChars[newKey] = existing;
+            return newChars;
+        }, {});
+        data.version = 3;
+    }
+    return data;
+}
+
+/**
+ * Resource handler for the `font` asset type. Loads a {@link Font} from a JSON glyph description
+ * and the texture pages that accompany it. Bitmap fonts and multi-channel signed distance field
+ * fonts are both supported.
+ *
+ * @category Asset
+ */
+class FontHandler extends ResourceHandler {
+    /**
+     * Create a new FontHandler instance.
+     *
+     * @param {AppBase} app - The running {@link AppBase}.
+     * @ignore
+     */
+    constructor(app) {
+        super(app, 'font');
+
+        this._loader = app.loader;
+        this.maxRetries = 0;
+    }
+
+    load(url, callback, asset) {
+        if (typeof url === 'string') {
+            url = {
+                load: url,
+                original: url
+            };
+        }
+
+        const self = this;
+        if (path.getExtension(url.original) === '.json') {
+            // load json data then load texture of same name
+            http.get(url.load, {
+                retry: this.maxRetries > 0,
+                maxRetries: this.maxRetries
+            }, (err, response) => {
+                // update asset data
+                if (!err) {
+                    const data = upgradeDataSchema(response);
+                    self._loadTextures(url.load.replace('.json', '.png'), data, (err, textures) => {
+                        if (err) {
+                            callback(err);
+                        } else {
+                            callback(null, {
+                                data: data,
+                                textures: textures
+                            });
+                        }
+                    });
+                } else {
+                    callback(`Error loading font resource: ${url.original} [${err}]`);
+                }
+            });
+
+        } else {
+            // upgrade asset data
+            if (asset && asset.data) {
+                asset.data = upgradeDataSchema(asset.data);
+            }
+            this._loadTextures(url.load, asset && asset.data, callback);
+        }
+    }
+
+    _loadTextures(url, data, callback) {
+        const numTextures = data.info.maps.length;
+        let numLoaded = 0;
+        let error = null;
+
+        const textures = new Array(numTextures);
+        const loader = this._loader;
+
+        // MSDF atlases must not be mipmapped: mip levels average the distance-field channels, and
+        // median(average) != average(median), so minified text samples a corrupted median. Request
+        // non-mipmapped textures at creation time (on WebGPU mipmaps cannot be disabled after
+        // creation), using per-load texture options on an ephemeral asset. Bitmap fonts keep
+        // their mipmaps.
+        const isMsdf = !data.type || data.type === FONT_MSDF;
+        const textureOptions = isMsdf ? { texture: { mipmaps: false, minFilter: FILTER_LINEAR } } : null;
+
+        const loadTexture = function (index) {
+            const onLoaded = function (err, texture) {
+                if (error) return;
+
+                if (err) {
+                    error = err;
+                    callback(err);
+                    return;
+                }
+
+                texture.upload();
+                textures[index] = texture;
+                numLoaded++;
+                if (numLoaded === numTextures) {
+                    callback(null, textures);
+                }
+            };
+
+            const pageUrl = index === 0 ? url : url.replace('.png', `${index}.png`);
+            const pageAsset = textureOptions ? new Asset(pageUrl, 'texture', { url: pageUrl }, null, textureOptions) : null;
+            loader.load(pageUrl, 'texture', onLoaded, pageAsset);
+        };
+
+        for (let i = 0; i < numTextures; i++) {
+            loadTexture(i);
+        }
+    }
+
+    open(url, data, asset) {
+        let font;
+        if (data.textures) {
+            // both data and textures exist
+            font = new Font(data.textures, data.data);
+        } else {
+            // only textures
+            font = new Font(data, null);
+        }
+
+        // give the font access to the loader so it can release its textures from the cache when
+        // the asset is unloaded
+        font._loader = this._loader;
+
+        return font;
+    }
+
+    patch(asset, assets) {
+        // if not already set, get font data block from asset
+        // and assign to font resource
+        const font = asset.resource;
+        if (!font.data && asset.data) {
+            // font data present in asset but not in font
+            font.data = asset.data;
+        } else if (!asset.data && font.data) {
+            // font data present in font but not in asset
+            asset.data = font.data;
+        }
+
+        if (asset.data) {
+            asset.data = upgradeDataSchema(asset.data);
+        }
+    }
+}
+
+export { FontHandler };

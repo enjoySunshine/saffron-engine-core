@@ -1,0 +1,19 @@
+{
+    "compilerOptions": {
+        "allowJs": true,
+        "allowSyntheticDefaultImports": true,
+        "checkJs": true,
+        "module": "es6",
+        "moduleResolution": "bundler",
+        "noImplicitReturns": true,
+        "noImplicitThis": true,
+        "noUnusedLocals": true,
+        "outDir": "types",
+        "rootDir": ".",
+        "strictNullChecks": true,
+        "strictPropertyInitialization": true,
+        "target": "es6",
+        "typeRoots": [ "./node_modules/@webgpu/types", "./node_modules/@types" ]
+    },
+    "include": ["src/**/*.js", "scripts/**/*.mjs", "playcanvas.d.ts"],
+}

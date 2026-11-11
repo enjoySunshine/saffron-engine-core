@@ -1,0 +1,317 @@
+import { path } from '../../core/path.js';
+import {
+    TEXHINT_ASSET,
+    ADDRESS_CLAMP_TO_EDGE, ADDRESS_MIRRORED_REPEAT, ADDRESS_REPEAT,
+    FILTER_LINEAR, FILTER_NEAREST, FILTER_NEAREST_MIPMAP_NEAREST, FILTER_NEAREST_MIPMAP_LINEAR, FILTER_LINEAR_MIPMAP_NEAREST, FILTER_LINEAR_MIPMAP_LINEAR,
+    PIXELFORMAT_RGB8, PIXELFORMAT_RGBA8, PIXELFORMAT_RGBA32F,
+    TEXTURETYPE_DEFAULT, TEXTURETYPE_RGBE, TEXTURETYPE_RGBM, TEXTURETYPE_SWIZZLEGGGR, TEXTURETYPE_RGBP
+} from '../../platform/graphics/constants.js';
+import { Texture } from '../../platform/graphics/texture.js';
+import { TextureUtils } from '../../platform/graphics/texture-utils.js';
+import { BasisParser } from '../parsers/texture/basis.js';
+import { ImgParser } from '../parsers/texture/img.js';
+import { KtxParser } from '../parsers/texture/ktx.js';
+import { Ktx2Parser } from '../parsers/texture/ktx2.js';
+import { DdsParser } from '../parsers/texture/dds.js';
+import { HdrParser } from '../parsers/texture/hdr.js';
+import { ResourceHandler } from './handler.js';
+
+/**
+ * @import { AppBase } from '../app-base.js'
+ * @import { Asset } from '../asset/asset.js'
+ */
+
+const JSON_ADDRESS_MODE = {
+    'repeat': ADDRESS_REPEAT,
+    'clamp': ADDRESS_CLAMP_TO_EDGE,
+    'mirror': ADDRESS_MIRRORED_REPEAT
+};
+
+const JSON_FILTER_MODE = {
+    'nearest': FILTER_NEAREST,
+    'linear': FILTER_LINEAR,
+    'nearest_mip_nearest': FILTER_NEAREST_MIPMAP_NEAREST,
+    'linear_mip_nearest': FILTER_LINEAR_MIPMAP_NEAREST,
+    'nearest_mip_linear': FILTER_NEAREST_MIPMAP_LINEAR,
+    'linear_mip_linear': FILTER_LINEAR_MIPMAP_LINEAR
+};
+
+const JSON_TEXTURE_TYPE = {
+    'default': TEXTURETYPE_DEFAULT,
+    'rgbm': TEXTURETYPE_RGBM,
+    'rgbe': TEXTURETYPE_RGBE,
+    'rgbp': TEXTURETYPE_RGBP,
+    'swizzleGGGR': TEXTURETYPE_SWIZZLEGGGR
+};
+
+// the type of the texture of a texture asset, as its data specifies it (this is bit of a mess)
+const getAssetDataTextureType = (asset) => {
+    const assetData = asset.data;
+    if (assetData.hasOwnProperty('type')) {
+        return JSON_TEXTURE_TYPE[assetData.type];
+    }
+    if (assetData.hasOwnProperty('rgbm') && assetData.rgbm) {
+        return TEXTURETYPE_RGBM;
+    }
+    if (asset.file && (asset.file.opt & 8) !== 0) {
+        // basis normalmaps flag the variant as swizzled
+        return TEXTURETYPE_SWIZZLEGGGR;
+    }
+    return TEXTURETYPE_DEFAULT;
+};
+
+// whether the file of a texture asset is an .hdr file, by the extension the parser is selected by
+const isHdrFile = (asset) => {
+    const name = asset.file?.filename || asset.file?.url;
+    return !!name && path.getExtension(name.split('?')[0]).toLowerCase() === '.hdr';
+};
+
+/**
+ * Returns whether the texture of a texture asset is sRGB, and its type, which together decide how
+ * a shader decodes the texture. These are known before the asset loads: its data specifies them,
+ * unless its per-load texture options override them.
+ *
+ * A few files decide these themselves, and are only known once loaded: a KTX file storing an sRGB
+ * format when the asset data does not specify srgb, a basis normal map which the transcoder
+ * unswizzles, and a DXT5 normal map.
+ *
+ * @param {Asset} asset - The texture asset.
+ * @returns {{srgb: boolean, type: string}} Whether the texture is sRGB, and its type.
+ * @ignore
+ */
+const getTextureAssetEncoding = (asset) => {
+    const options = asset.options?.texture;
+
+    // the hdr parser records the rgbe type of an .hdr file in the asset data as it starts loading
+    // the file, which can be after this is needed - such as when the file is in a bundle
+    const type = !asset.data.type && isHdrFile(asset) ? TEXTURETYPE_RGBE : getAssetDataTextureType(asset);
+
+    return {
+        srgb: !!(options?.srgb ?? asset.data.srgb),
+        type: options?.type ?? type
+    };
+};
+
+// In the case where a texture has more than 1 level of mip data specified, but not the full
+// mip chain, we generate the missing levels here.
+// This is to overcome an issue where iphone xr and xs ignores further updates to the mip data
+// after invoking gl.generateMipmap on the texture (which was the previous method of ensuring
+// the texture's full mip chain was complete).
+// NOTE: this function only resamples RGBA8 and RGBAFloat32 data.
+const _completePartialMipmapChain = function (texture) {
+
+    const requiredMipLevels = TextureUtils.calcMipLevelsCount(texture._width, texture._height);
+
+    const isHtmlElement = function (object) {
+        return (typeof HTMLCanvasElement !== 'undefined' && object instanceof HTMLCanvasElement) ||
+               (typeof HTMLImageElement !== 'undefined' && object instanceof HTMLImageElement) ||
+               (typeof HTMLVideoElement !== 'undefined' && object instanceof HTMLVideoElement);
+    };
+
+    if (!(texture._format === PIXELFORMAT_RGBA8 ||
+          texture._format === PIXELFORMAT_RGBA32F) ||
+          texture._volume ||
+          texture._compressed ||
+          texture._levels.length === 1 ||
+          texture._levels.length === requiredMipLevels ||
+          isHtmlElement(texture._cubemap ? texture._levels[0][0] : texture._levels[0])) {
+        return;
+    }
+
+    const downsample = function (width, height, data) {
+        const sampledWidth = Math.max(1, width >> 1);
+        const sampledHeight = Math.max(1, height >> 1);
+        const sampledData = new data.constructor(sampledWidth * sampledHeight * 4);
+
+        const xs = Math.floor(width / sampledWidth);
+        const ys = Math.floor(height / sampledHeight);
+        const xsys = xs * ys;
+
+        for (let y = 0; y < sampledHeight; ++y) {
+            for (let x = 0; x < sampledWidth; ++x) {
+                for (let e = 0; e < 4; ++e) {
+                    let sum = 0;
+                    for (let sy = 0; sy < ys; ++sy) {
+                        for (let sx = 0; sx < xs; ++sx) {
+                            sum += data[(x * xs + sx + (y * ys + sy) * width) * 4 + e];
+                        }
+                    }
+                    sampledData[(x + y * sampledWidth) * 4 + e] = sum / xsys;
+                }
+            }
+        }
+
+        return sampledData;
+    };
+
+    // step through levels
+    for (let level = texture._levels.length; level < requiredMipLevels; ++level) {
+        const width = Math.max(1, texture._width >> (level - 1));
+        const height = Math.max(1, texture._height >> (level - 1));
+        if (texture._cubemap) {
+            const mips = [];
+            for (let face = 0; face < 6; ++face) {
+                mips.push(downsample(width, height, texture._levels[level - 1][face]));
+            }
+            texture._levels.push(mips);
+        } else {
+            texture._levels.push(downsample(width, height, texture._levels[level - 1]));
+        }
+    }
+
+    texture._levelsUpdated = texture._cubemap ? [[true, true, true, true, true, true]] : [true];
+};
+
+/**
+ * Resource handler for the `texture` asset type. Loads 2D and 3D {@link Texture} resources from
+ * any image format the browser decodes, such as PNG, JPEG, WebP and AVIF, and from DDS, KTX,
+ * KTX2, Basis and HDR files.
+ *
+ * @category Asset
+ */
+class TextureHandler extends ResourceHandler {
+    /**
+     * Create a new TextureHandler instance.
+     *
+     * @param {AppBase} app - The running {@link AppBase}.
+     * @ignore
+     */
+    constructor(app) {
+        super(app, 'texture');
+
+        const device = app.graphicsDevice;
+        this._device = device;
+
+        // img parser handles all browser-supported image formats and acts as the catch-all. It is
+        // registered first so the format-specific parsers below - and any user-registered parsers -
+        // take precedence during newest-first selection.
+        this.imgParser = new ImgParser(app.assets, device);
+        this.addParser(this.imgParser);
+
+        this.addParser(new DdsParser());
+        this.addParser(new KtxParser());
+        this.addParser(new Ktx2Parser(device));
+        this.addParser(new BasisParser(device));
+        this.addParser(new HdrParser());
+    }
+
+    set crossOrigin(value) {
+        this.imgParser.crossOrigin = value;
+    }
+
+    get crossOrigin() {
+        return this.imgParser.crossOrigin;
+    }
+
+    _getTextureOptions(asset) {
+
+        const options = {
+            // #if _PROFILER
+            profilerHint: TEXHINT_ASSET
+            // #endif
+        };
+
+        if (asset) {
+            if (asset.name?.length > 0) {
+                options.name = asset.name;
+            }
+
+            const assetData = asset.data;
+
+            if (assetData.hasOwnProperty('minfilter')) {
+                options.minFilter = JSON_FILTER_MODE[assetData.minfilter];
+            }
+
+            if (assetData.hasOwnProperty('magfilter')) {
+                options.magFilter = JSON_FILTER_MODE[assetData.magfilter];
+            }
+
+            if (assetData.hasOwnProperty('addressu')) {
+                options.addressU = JSON_ADDRESS_MODE[assetData.addressu];
+            }
+
+            if (assetData.hasOwnProperty('addressv')) {
+                options.addressV = JSON_ADDRESS_MODE[assetData.addressv];
+            }
+
+            if (assetData.hasOwnProperty('mipmaps')) {
+                options.mipmaps = assetData.mipmaps;
+            }
+
+            if (assetData.hasOwnProperty('anisotropy')) {
+                options.anisotropy = assetData.anisotropy;
+            }
+
+            if (assetData.hasOwnProperty('flipY')) {
+                options.flipY = !!assetData.flipY;
+            }
+
+            if (assetData.hasOwnProperty('srgb')) {
+                options.srgb = !!assetData.srgb;
+            }
+
+            options.type = getAssetDataTextureType(asset);
+
+            // per-load creation options (raw Texture constructor options, for example
+            // { mipmaps: false, minFilter: FILTER_LINEAR }) override the asset-derived options
+            if (asset.options?.texture) {
+                Object.assign(options, asset.options.texture);
+            }
+        }
+
+        return options;
+    }
+
+    open(url, data, asset) {
+        // no url means no parser can be selected (the loader.open path) - not supported for textures
+        if (!url) {
+            return undefined;
+        }
+
+        // texture parsers use an extended open(url, data, device, textureOptions) signature, so the
+        // handler drives the delegation (and the shared post-processing below) instead of the base open
+        const parser = this._selectParser(this._makeContext(url, asset));
+
+        // the img catch-all normally guarantees a parser - guard against a user-modified registry
+        // (for example with the img parser removed to reject unknown formats)
+        if (!parser) {
+            return undefined;
+        }
+        const textureOptions = this._getTextureOptions(asset);
+        let texture = parser.open(url, data, this._device, textureOptions);
+
+        if (texture === null) {
+            texture = new Texture(this._device, {
+                width: 4,
+                height: 4,
+                format: PIXELFORMAT_RGB8
+            });
+        } else {
+            // check if the texture has only a partial mipmap chain specified and generate the
+            // missing levels if possible.
+            _completePartialMipmapChain(texture);
+
+            // if the basis transcoder unswizzled a GGGR texture, remove the flag from the asset
+            if (data.unswizzledGGGR) {
+                asset.file.variants.basis.opt &= ~8;
+            }
+        }
+
+        return texture;
+    }
+
+    patch(asset, assets) {
+        const texture = asset.resource;
+        if (!texture) {
+            return;
+        }
+
+        // apply asset options, based on asset.data
+        const options = this._getTextureOptions(asset);
+        for (const key of Object.keys(options)) {
+            texture[key] = options[key];
+        }
+    }
+}
+
+export { TextureHandler, getTextureAssetEncoding };

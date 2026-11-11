@@ -1,0 +1,331 @@
+// Single-pass projector for the hybrid GSplat renderer.
+//
+// For each visible splat (compactedSplatIds[threadIdx]) this pass:
+//   1. Projects the splat to clip + screen space (computeSplatCov), applying the same
+//      alpha / minPixelSize / minContribution / off-screen culls used by the compute renderer.
+//   2. Derives the eigen-vectors v1, v2 (same eigen-decomposition as gsplatCorner.js).
+//   3. Computes a depth-based sort key (camera-relative bin weighting; matches CPU worker sort keys,
+//      optionally radial via RADIAL_SORT define).
+//   4. Workgroup-local atomic compaction: each thread that survives culling gets a slot
+//      via a shared atomic, then the workgroup leader reserves a contiguous range in the
+//      global renderCounter. This caps global atomics at one per workgroup.
+//   5. Writes the 8 u32 slots of the projection cache and the sort key.
+//
+// Bindings 0..6 are fixed; texture bindings for the work-buffer format follow them
+// (injected via gsplatFormatDeclCS, starting at binding {FIXED_BINDINGS_LEN}).
+//
+// 3DGS only. Fisheye is supported via the GSPLAT_FISHEYE define: when enabled
+// the projector writes (ndc.x, ndc.y, depthNdc, 1.0) into the cache (matching
+// gsplatCenter.js) and the hybrid VS reconstructs linear view depth from clip
+// via clipToViewZ = (0, 0, far - near, near). For perspective + orthographic
+// the projector keeps writing real clipPos and the VS uses the
+// inverse-projection-derived clipToViewZ.
+export const computeGsplatProjectorSource = /* wgsl */`
+
+#include "gsplatCommonCS"
+#include "dispatchThreadsCS"
+
+@group(0) @binding(0) var<storage, read> compactedSplatIds: array<u32>;
+@group(0) @binding(1) var<storage, read> sortElementCount: array<u32>;
+@group(0) @binding(2) var<storage, read_write> projCache: array<u32>;
+@group(0) @binding(3) var<storage, read_write> sortKeys: array<u32>;
+@group(0) @binding(4) var<storage, read_write> renderCounter: array<atomic<u32>>;
+
+// Camera-relative bin weighting for sort key computation (32 entries of {base, divider}).
+struct BinWeight {
+    base: f32,
+    divider: f32
+}
+@group(0) @binding(5) var<storage, read> binWeights: array<BinWeight>;
+
+struct ProjectorUniforms {
+    splatTextureSize: u32,
+    numBins: u32,
+    isOrtho: u32,
+    stochastic: u32,
+    viewProj: mat4x4f,
+    viewMatrix: mat4x4f,
+    cameraPosition: vec3f,
+    minPixelSize: f32,
+    cameraDirection: vec3f,
+    focal: f32,
+    focalY: f32,
+    viewportWidth: f32,
+    viewportHeight: f32,
+    nearClip: f32,
+    farClip: f32,
+    alphaClip: f32,
+    minContribution: f32,
+    minDist: f32,
+    invRange: f32,
+    foveationStrength: f32,
+    foveationCenter: f32,
+    antiAliasFilterSize: f32,
+    sortKeyMinBits: i32,
+    sortKeyScale: f32,
+    maxSortKey: u32,
+    #ifdef GSPLAT_XR
+        // Eye-1 view-projection (raw XR projViewOffMat). Eye 0 uses viewProj above.
+        // Appended only for the stereo variant - matches the conditional CPU UBO field.
+        viewProj1: mat4x4f,
+    #endif
+    #ifdef GSPLAT_FISHEYE
+        fisheye_k: f32,
+        fisheye_inv_k: f32,
+        fisheye_projMat00: f32,
+        fisheye_projMat11: f32,
+    #endif
+}
+@group(0) @binding(6) var<uniform> uniforms: ProjectorUniforms;
+
+#include "gsplatComputeSplatCS"
+#include "gsplatFormatDeclCS"
+#include "gsplatFormatReadCS"
+#include "gsplatHelpersVS"
+#ifdef GSPLAT_USER_VARYINGS
+    #include "gsplatUserVaryingsCS"
+#endif
+#include "gsplatModifyVS"
+#include "gsplatProjectCommonCS"
+
+// One global atomicAdd per workgroup (256 threads) — drastically lowers contention
+// vs a per-thread atomic on the global counter without needing subgroup ops.
+var<workgroup> wgCount: atomic<u32>;
+var<workgroup> wgBase: u32;
+
+// Sort key spaced by log distance (same as CPU worker). A positive float's bit pattern grows with
+// its value almost exactly as its log2, so keys taken from the bits give every doubling of
+// distance the same number of keys, and splats far away cost no precision near the camera. The
+// bits are measured from those of a distance ten doublings inside the near clip (splats closer than
+// it are drawn too), and inverted so far splats sort first.
+fn logSortKey(value: f32) -> u32 {
+    let bits = bitcast<i32>(value) - uniforms.sortKeyMinBits;
+    let keyFromNear = clamp(f32(bits) * uniforms.sortKeyScale, 0.0, f32(uniforms.maxSortKey));
+    return uniforms.maxSortKey - u32(keyFromNear);
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(global_invocation_id) gid: vec3u,
+    @builtin(local_invocation_index) localIdx: u32
+) {
+    if (localIdx == 0u) {
+        atomicStore(&wgCount, 0u);
+    }
+    workgroupBarrier();
+
+    // the flat thread index, also when the dispatch is spread over rows of workgroups
+    let threadIdx = dispatchThreadIndex(gid);
+    let numVisible = sortElementCount[0];
+
+    var valid = false;
+    var clipPos: vec4f = vec4f(0.0);
+    var v1: vec2f = vec2f(0.0);
+    var v2: vec2f = vec2f(0.0);
+    var rgb: vec3f = vec3f(0.0);
+    var alpha: f32 = 0.0;
+    var pcId: u32 = 0u;
+    var sortKey: u32 = 0u;
+    #ifdef GSPLAT_XR
+        // Eye-1 NDC (eye 0 NDC is derived from clipPos in the write below).
+        var ndc1: vec2f = vec2f(0.0);
+    #endif
+
+    let projected = projectSplatCommon(
+        threadIdx,
+        numVisible,
+        uniforms.alphaClip,
+        uniforms.minPixelSize,
+        uniforms.minContribution,
+        uniforms.foveationStrength,
+        uniforms.foveationCenter,
+        uniforms.antiAliasFilterSize,
+        uniforms.viewMatrix,
+        uniforms.viewProj,
+        vec2f(uniforms.focal, uniforms.focalY),
+        uniforms.viewportWidth,
+        uniforms.viewportHeight,
+        uniforms.nearClip,
+        uniforms.farClip,
+        uniforms.isOrtho,
+        #ifdef GSPLAT_FISHEYE
+            uniforms.fisheye_k,
+            uniforms.fisheye_inv_k,
+            uniforms.fisheye_projMat00,
+            uniforms.fisheye_projMat11,
+        #endif
+        #ifdef GSPLAT_XR
+            uniforms.viewProj1,
+        #endif
+    );
+
+    if (projected.valid) {
+        let center = projected.center;
+        let opacity = projected.opacity;
+        let proj = projected.proj;
+
+        // Eigen-decomposition matches gsplatCorner.js initCornerCov: derives the two
+        // screen-pixel eigen-vectors of the 2D screen-space covariance.
+        let mid = 0.5 * (proj.a + proj.c);
+        let radius = length(vec2f(0.5 * (proj.a - proj.c), proj.b));
+        let lambda1 = mid + radius;
+        let lambda2 = max(mid - radius, 0.1);
+
+        // capScale was already applied to a, b, c inside computeSplatCov so the
+        // eigenvalues here are already in the radius-capped space. The vmin
+        // saturation mirrors gsplatCorner.js (line 89-90) for hard parity with
+        // the existing rasterizer when capScale > 1.
+        let vmin = min(1024.0, min(uniforms.viewportWidth, uniforms.viewportHeight));
+        let l1 = 2.0 * min(sqrt(2.0 * lambda1), vmin);
+        let l2 = 2.0 * min(sqrt(2.0 * lambda2), vmin);
+
+        let dir = normalize(vec2f(proj.b, lambda1 - proj.a));
+        v1 = l1 * dir;
+        v2 = l2 * vec2f(dir.y, -dir.x);
+
+        // Clip-space center. The hybrid VS uses clipPos.w directly for both
+        // output.position.w (rasterizer correctness) and corner scale, and
+        // reconstructs linear view depth from clipPos via the clipToViewZ uniform.
+        #ifdef GSPLAT_FISHEYE
+            // Fisheye: invert the screen→pixel mapping done by computeSplatCov to recover
+            // NDC, then store NDC + linear depthNdc with w=1.0 (matches gsplatCenter.js).
+            // The rasterizer's perspective divide is a no-op (w=1), so output.position is
+            // NDC directly. The VS recovers linear -view.z via clipToViewZ = (0, 0, far-near, near).
+            let viewCenter = uniforms.viewMatrix * vec4f(center, 1.0);
+            let neg_z = -viewCenter.z;
+            let ndcX = proj.screen.x / uniforms.viewportWidth * 2.0 - 1.0;
+            let ndcY = proj.screen.y / uniforms.viewportHeight * 2.0 - 1.0;
+            let depthNdc = clamp(
+                (neg_z - uniforms.nearClip) / (uniforms.farClip - uniforms.nearClip),
+                0.0, 1.0
+            );
+            clipPos = vec4f(ndcX, ndcY, depthNdc, 1.0);
+        #else
+            clipPos = uniforms.viewProj * vec4f(center, 1.0);
+            clipPos.z = clamp(clipPos.z, 0.0, abs(clipPos.w));
+        #endif
+
+        // Stereo: eye-1 NDC was already computed by computeSplatCov for the union visibility
+        // test; reuse it for the cache write. Everything else (covariance/eigenvectors, depth w,
+        // color, sort key) is shared from eye 0.
+        #ifdef GSPLAT_XR
+            ndc1 = proj.ndc1;
+        #endif
+
+        // Preserve the splat identity across projection compaction and camera movement.
+        if (uniforms.stochastic != 0u) {
+            sortKey = projected.splatId;
+        } else {
+            #ifdef RADIAL_SORT
+                // from the squared distance, whose bits follow log2 as well
+                let delta = center - uniforms.cameraPosition;
+                sortKey = logSortKey(dot(delta, delta));
+            #else
+                let s = dot(center - uniforms.cameraPosition, uniforms.cameraDirection);
+                // maxSortKey is zero when the keys use the depth bins
+                if (uniforms.maxSortKey != 0u) {
+                    // depth in front of the camera: cameraDirection is the camera's +Z, which points
+                    // backwards. Splats far inside the near clip share the nearest key.
+                    sortKey = logSortKey(max(-s, 0.0));
+                } else {
+                    // Orthographic or fisheye, where splats at or behind the camera can be drawn:
+                    // shared depth-bin weighting (same as CPU worker). The in-bin fraction is
+                    // computed from the camera-relative distance so splats near the camera keep full
+                    // f32 precision (instead of the ~2^-19 of a [0, numBins) float).
+                    let numBinsF = f32(uniforms.numBins);
+                    let invBinSize = uniforms.invRange * numBinsF;
+                    let d = (s - uniforms.minDist) * invBinSize;
+                    let bin = u32(clamp(d, 0.0, numBinsF - 0.001));
+                    let binFrac = s * invBinSize - (uniforms.minDist * invBinSize + f32(bin));
+                    let bw = binWeights[bin];
+                    let divider = u32(bw.divider);
+                    let offset = min(u32(bw.divider * clamp(binFrac, 0.0, 1.0)), divider - 1u);
+                    sortKey = u32(bw.base) + offset;
+                }
+            #endif
+        }
+
+        // assemble (rgb, a) and run the render-stage color modifier on the modified center,
+        // matching the quad renderer's gsplatVS (modifySplatColor after AA compensation).
+        #ifdef PICK_MODE
+            // picking does not apply AA opacity compensation (it only gates on a binary
+            // opacity threshold), but the modifier may still adjust alpha.
+            var clr = vec4f(getColor(), opacity);
+            modifySplatColor(center, &clr);
+            pcId = loadPcId().r;
+            alpha = clr.a;
+        #else
+            var clr = vec4f(getColor(), opacity);
+            #if GSPLAT_AA
+                // Bake the AA opacity compensation into the cached alpha (the hybrid VS
+                // reads it pre-modulated). Only compiled for the non-pick variant.
+                clr.a = clr.a * proj.aaFactor;
+            #endif
+            modifySplatColor(center, &clr);
+            rgb = max(clr.rgb, vec3f(0.0));
+            alpha = clr.a;
+        #endif
+
+        // cull splats the color modifier faded out, so they get no slot, cache entry or sort key
+        valid = alpha > uniforms.alphaClip;
+    }
+
+    // Reserve a per-workgroup slot for this thread.
+    var localDst: u32 = 0u;
+    if (valid) {
+        localDst = atomicAdd(&wgCount, 1u);
+    }
+    workgroupBarrier();
+
+    // Workgroup leader reserves a contiguous output range in renderCounter[0].
+    if (localIdx == 0u) {
+        let total = atomicLoad(&wgCount);
+        wgBase = atomicAdd(&renderCounter[0], total);
+    }
+    workgroupBarrier();
+
+    if (valid) {
+        let dst = wgBase + localDst;
+        let base = dst * {CACHE_STRIDE}u;
+
+        #ifdef GSPLAT_XR
+            // Stereo layout: per-eye NDC in [0..3], shared w/v1/v2/color in [4..7].
+            // clip.z is not stored — the hybrid VS reconstructs it from w (perspective only).
+            let ndc0 = clipPos.xy / clipPos.w;
+            projCache[base + 0u] = bitcast<u32>(ndc0.x);
+            projCache[base + 1u] = bitcast<u32>(ndc0.y);
+            projCache[base + 2u] = bitcast<u32>(ndc1.x);
+            projCache[base + 3u] = bitcast<u32>(ndc1.y);
+            projCache[base + 4u] = bitcast<u32>(clipPos.w);
+            projCache[base + 5u] = pack2x16float(v1);
+            projCache[base + 6u] = pack2x16float(v2);
+            // alpha as the SOG v3 opacity byte, sqrt(alpha) / 1.25, so it can exceed 1 (see gsplatHybridVS)
+            projCache[base + 7u] = pack4x8unorm(vec4f(rgb, sqrt(clamp(alpha, 0.0, 1.5625)) / 1.25));
+        #else
+            projCache[base + 0u] = bitcast<u32>(clipPos.x);
+            projCache[base + 1u] = bitcast<u32>(clipPos.y);
+            projCache[base + 2u] = bitcast<u32>(clipPos.z);
+            projCache[base + 3u] = bitcast<u32>(clipPos.w);
+            projCache[base + 4u] = pack2x16float(v1);
+            projCache[base + 5u] = pack2x16float(v2);
+
+            #ifdef PICK_MODE
+                projCache[base + 6u] = pcId;
+                projCache[base + 7u] = pack2x16float(vec2f(0.0, alpha));
+            #else
+                projCache[base + 6u] = pack2x16float(vec2f(rgb.x, rgb.y));
+                projCache[base + 7u] = pack2x16float(vec2f(rgb.z, alpha));
+            #endif
+        #endif
+
+        // append user varying values (written by the modify functions) to the cache
+        #ifdef GSPLAT_USER_VARYINGS
+            #include "gsplatUserCacheWriteCS"
+        #endif
+
+        sortKeys[dst] = sortKey;
+    }
+}
+`;
+
+export default computeGsplatProjectorSource;

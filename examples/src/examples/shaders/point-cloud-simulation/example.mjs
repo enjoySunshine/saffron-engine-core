@@ -1,0 +1,183 @@
+import {
+    AppBase,
+    AppOptions,
+    BLEND_ADDITIVEALPHA,
+    BoundingBox,
+    CameraComponentSystem,
+    Color,
+    Entity,
+    FILLMODE_FILL_WINDOW,
+    Mesh,
+    MeshInstance,
+    PRIMITIVE_POINTS,
+    RESOLUTION_AUTO,
+    RenderComponentSystem,
+    SEMANTIC_POSITION,
+    SEMANTIC_TEXCOORD0,
+    ShaderMaterial,
+    Vec3,
+    createGraphicsDevice
+} from 'playcanvas';
+
+import { deviceType } from 'examples/context';
+
+import shaderFrag from './shader.frag';
+import shaderVert from './shader.vert';
+
+const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('application-canvas'));
+window.focus();
+
+const gfxOptions = {
+    deviceTypes: [deviceType],
+    glslangUrl: './assets/wasm/glslang/glslang.js',
+    twgslUrl: './assets/wasm/twgsl/twgsl.js'
+};
+
+const device = await createGraphicsDevice(canvas, gfxOptions);
+device.maxPixelRatio = Math.min(window.devicePixelRatio, 2);
+
+// Render to low resolution to make particles more visible on WebGPU, as it doesn't support point
+// size and those are very small otherwise. This is not a proper solution, and only a temporary
+// workaround specifically for this example use case.
+if (device.isWebGPU) {
+    device.maxPixelRatio = 0.2;
+}
+
+const createOptions = new AppOptions();
+createOptions.graphicsDevice = device;
+
+createOptions.componentSystems = [RenderComponentSystem, CameraComponentSystem];
+
+const app = new AppBase(canvas);
+app.init(createOptions);
+app.start();
+
+// Set the canvas to fill the window and automatically change resolution to be the same as the canvas size
+app.setCanvasFillMode(FILLMODE_FILL_WINDOW);
+app.setCanvasResolution(RESOLUTION_AUTO);
+
+// Ensure canvas is resized when window changes size
+const resize = () => app.resizeCanvas();
+window.addEventListener('resize', resize);
+app.on('destroy', () => {
+    window.removeEventListener('resize', resize);
+});
+
+// Create an Entity with a camera component
+const camera = new Entity();
+camera.addComponent('camera', {
+    clearColor: new Color(0, 0, 0)
+});
+
+// Add entity into scene hierarchy
+app.root.addChild(camera);
+
+// Allocate two buffers to store positions of particles
+const maxNumPoints = 100000;
+let visiblePoints = 10000;
+const positions = new Float32Array(3 * maxNumPoints);
+const oldPositions = new Float32Array(3 * maxNumPoints);
+
+// Generate random positions and old positions within small cube (delta between them represents velocity)
+for (let i = 0; i < 3 * maxNumPoints; i++) {
+    positions[i] = Math.random() * 2 - 1;
+    oldPositions[i] = positions[i] + Math.random() * 0.04 - 0.01;
+}
+
+/**
+ * Helper function to update vertex of the mesh
+ * @param {Mesh} mesh - The mesh.
+ */
+function updateMesh(mesh) {
+    // Set current positions on mesh - this reallocates vertex buffer if more space is needed to test it.
+    // For best performance, we could preallocate enough space using mesh.Clear.
+    // Also turn off bounding box generation, as we set up large box manually
+    mesh.setPositions(positions, 3, visiblePoints);
+    mesh.update(PRIMITIVE_POINTS, false);
+}
+
+// Create a mesh with dynamic vertex buffer (index buffer is not needed)
+const mesh = new Mesh(app.graphicsDevice);
+mesh.clear(true);
+updateMesh(mesh);
+
+// Set large bounding box so we don't need to update it each frame
+mesh.aabb = new BoundingBox(new Vec3(0, 0, 0), new Vec3(15, 15, 15));
+
+// Create a new material with a custom shader
+const material = new ShaderMaterial({
+    uniqueName: 'MyShader',
+    vertexGLSL: shaderVert,
+    fragmentGLSL: shaderFrag,
+    attributes: {
+        aPosition: SEMANTIC_POSITION,
+        aUv0: SEMANTIC_TEXCOORD0
+    }
+});
+
+material.blendType = BLEND_ADDITIVEALPHA;
+material.depthWrite = false;
+
+// Create the mesh instance
+const meshInstance = new MeshInstance(mesh, material);
+
+// Create Entity to render the mesh instances using a render component
+const entity = new Entity();
+entity.addComponent('render', {
+    type: 'asset',
+    meshInstances: [meshInstance],
+    material: material,
+    castShadows: false
+});
+app.root.addChild(entity);
+
+// Set an update function on the app's update event
+let time = 0,
+    previousTime;
+app.on('update', (dt) => {
+    previousTime = time;
+    time += dt;
+
+    // Update particle positions using simple Verlet integration, and keep them inside a sphere boundary
+    let dist;
+    const pos = new Vec3();
+    const old = new Vec3();
+    const delta = new Vec3();
+    const next = new Vec3();
+    for (let i = 0; i < maxNumPoints; i++) {
+        // Read positions from buffers
+        old.set(oldPositions[i * 3], oldPositions[i * 3 + 1], oldPositions[i * 3 + 2]);
+        pos.set(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
+
+        // Verlet integration to move them
+        delta.sub2(pos, old);
+        next.add2(pos, delta);
+
+        // Boundary collision to keep them inside a sphere. If outside, simply move them in opposite direction
+        dist = next.length();
+        if (dist > 15) next.copy(old);
+
+        // Write out changed positions
+        positions[i * 3] = next.x;
+        positions[i * 3 + 1] = next.y;
+        positions[i * 3 + 2] = next.z;
+
+        oldPositions[i * 3] = pos.x;
+        oldPositions[i * 3 + 1] = pos.y;
+        oldPositions[i * 3 + 2] = pos.z;
+    }
+
+    // Once a second change how many points are visible
+    if (Math.round(time) !== Math.round(previousTime)) {
+        visiblePoints = Math.floor(50000 + Math.random() * maxNumPoints - 50000);
+    }
+
+    // Update mesh vertices
+    updateMesh(mesh);
+
+    // Rotate the camera around
+    const cameraTime = time * 0.2;
+    const cameraPos = new Vec3(20 * Math.sin(cameraTime), 10, 20 * Math.cos(cameraTime));
+    camera.setLocalPosition(cameraPos);
+    camera.lookAt(Vec3.ZERO);
+});

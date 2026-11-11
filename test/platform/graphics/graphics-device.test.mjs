@@ -1,0 +1,204 @@
+import { expect } from 'chai';
+
+import {
+    PIXELFORMAT_RG11B10F, PIXELFORMAT_R16F, PIXELFORMAT_R32F, PIXELFORMAT_RG16F, PIXELFORMAT_RG32F,
+    PIXELFORMAT_RGB16F, PIXELFORMAT_RGB32F, PIXELFORMAT_RGBA16F, PIXELFORMAT_RGBA32F
+} from '../../../src/platform/graphics/constants.js';
+import { NullGraphicsDevice } from '../../../src/platform/graphics/null/null-graphics-device.js';
+import { createGraphicsDevice } from '../../device.mjs';
+import { jsdomSetup, jsdomTeardown } from '../../jsdom.mjs';
+
+describe('GraphicsDevice', function () {
+
+    describe('#constructor', function () {
+
+        it('does not throw with a mock canvas lacking getBoundingClientRect', function () {
+            const device = createGraphicsDevice({ id: 'mock' });
+            expect(device.clientRect.width).to.equal(0);
+            expect(device.clientRect.height).to.equal(0);
+            device.destroy();
+        });
+
+        it('initializes clientRect from mock canvas width and height', function () {
+            const device = createGraphicsDevice({ width: 300, height: 150 });
+            expect(device.clientRect.width).to.equal(300);
+            expect(device.clientRect.height).to.equal(150);
+            device.destroy();
+        });
+
+        describe('with a DOM canvas', function () {
+
+            beforeEach(function () {
+                jsdomSetup();
+            });
+
+            afterEach(function () {
+                jsdomTeardown();
+            });
+
+            it('initializes clientRect using getBoundingClientRect', function () {
+                const canvas = document.createElement('canvas');
+                canvas.getBoundingClientRect = () => ({ width: 640, height: 480 });
+                const device = createGraphicsDevice(canvas);
+                expect(device.clientRect.width).to.equal(640);
+                expect(device.clientRect.height).to.equal(480);
+                device.destroy();
+            });
+        });
+    });
+
+    describe('#clearVertexBuffer', function () {
+
+        it('empties the vertex buffers of the next draw, keeping the list', function () {
+            const device = createGraphicsDevice({ width: 300, height: 150 });
+            const list = device.vertexBuffers;
+            const a = {};
+            const b = {};
+            const c = {};
+
+            device.setVertexBuffer(a);
+            device.setVertexBuffer(b);
+            expect(device.vertexBuffers).to.deep.equal([a, b]);
+
+            device.clearVertexBuffer();
+            expect(device.vertexBuffers).to.have.lengthOf(0);
+            expect(device.vertexBuffers).to.equal(list);
+
+            device.setVertexBuffer(c);
+            expect(device.vertexBuffers).to.deep.equal([c]);
+            device.destroy();
+        });
+
+    });
+
+    describe('#resizeCanvas', function () {
+
+        it('resizes the canvas and fires resizecanvas', function () {
+            const device = createGraphicsDevice({ width: 300, height: 150 });
+            const sizes = [];
+            device.on('resizecanvas', (w, h) => sizes.push([w, h]));
+
+            device.resizeCanvas(640, 480);
+
+            expect(device.canvas.width).to.equal(640);
+            expect(device.canvas.height).to.equal(480);
+            expect(sizes).to.deep.equal([[640, 480]]);
+            device.destroy();
+        });
+
+        it('keeps the current resolution when the size is zero', function () {
+            const device = createGraphicsDevice({ width: 300, height: 150 });
+            device.resizeCanvas(640, 480);
+            const sizes = [];
+            device.on('resizecanvas', (w, h) => sizes.push([w, h]));
+
+            device.resizeCanvas(0, 0);
+            device.resizeCanvas(0, 480);
+            device.resizeCanvas(640, 0);
+            device.resizeCanvas(0.4, 480);
+
+            expect(device.canvas.width).to.equal(640);
+            expect(device.canvas.height).to.equal(480);
+            expect(sizes).to.have.lengthOf(0);
+
+            device.resizeCanvas(800, 600);
+
+            expect(device.canvas.width).to.equal(800);
+            expect(device.canvas.height).to.equal(600);
+            expect(sizes).to.deep.equal([[800, 600]]);
+            device.destroy();
+        });
+    });
+
+    describe('#isContextLost', function () {
+
+        it('reports a destroyed device as lost without a context loss event', function () {
+            const device = createGraphicsDevice({ id: 'mock' });
+            expect(device.isContextLost()).to.be.false;
+
+            device.destroy();
+
+            expect(device.isContextLost()).to.be.true;
+        });
+    });
+
+    describe('#getRenderableHdrFormat', function () {
+
+        let device;
+
+        beforeEach(function () {
+            // these tests check the format selection against the null device's capabilities: it is
+            // renderable in both float precisions, but supports neither the filtering nor the
+            // blending of the 32bit float formats
+            device = new NullGraphicsDevice({ id: 'mock' });
+        });
+
+        afterEach(function () {
+            device.destroy();
+        });
+
+        it('returns the first supported format from the supplied list', function () {
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_RGBA32F, PIXELFORMAT_RGBA16F], false)).to.equal(PIXELFORMAT_RGBA32F);
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_RG11B10F, PIXELFORMAT_RGBA16F], false)).to.equal(PIXELFORMAT_RGBA16F);
+            expect(device.getRenderableHdrFormat()).to.equal(PIXELFORMAT_RGBA16F);
+        });
+
+        it('supports every channel count of both float precisions', function () {
+            const formats = [
+                PIXELFORMAT_R16F, PIXELFORMAT_RG16F, PIXELFORMAT_RGBA16F,
+                PIXELFORMAT_R32F, PIXELFORMAT_RG32F, PIXELFORMAT_RGBA32F
+            ];
+            formats.forEach((format) => {
+                expect(device.getRenderableHdrFormat([format], false)).to.equal(format);
+            });
+        });
+
+        it('skips a format it does not handle instead of failing', function () {
+            // three channel float formats are not renderable on either backend
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_RGB16F, PIXELFORMAT_RGB32F], false)).to.be.undefined;
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_RGB32F, PIXELFORMAT_R16F], false)).to.equal(PIXELFORMAT_R16F);
+        });
+
+        it('falls back to a half float format when 32bit float blending is not supported', function () {
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R32F, PIXELFORMAT_R16F], false, 1, true)).to.equal(PIXELFORMAT_R16F);
+        });
+
+        it('returns a 32bit float format when its blending is supported', function () {
+            device.textureFloatBlendable = true;
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R32F, PIXELFORMAT_R16F], false, 1, true)).to.equal(PIXELFORMAT_R32F);
+        });
+
+        it('tests filtering and blending independently', function () {
+
+            // blendable but not filterable
+            device.textureFloatBlendable = true;
+            device.textureFloatFilterable = false;
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R32F], true, 1, true)).to.be.undefined;
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R32F], false, 1, true)).to.equal(PIXELFORMAT_R32F);
+
+            // filterable but not blendable
+            device.textureFloatBlendable = false;
+            device.textureFloatFilterable = true;
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R32F], true, 1, true)).to.be.undefined;
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R32F], true, 1, false)).to.equal(PIXELFORMAT_R32F);
+        });
+
+        it('does not require a blending capability for the half float formats', function () {
+            expect(device.textureFloatBlendable).to.be.false;
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R16F], false, 1, true)).to.equal(PIXELFORMAT_R16F);
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_RGBA16F], false, 1, true)).to.equal(PIXELFORMAT_RGBA16F);
+        });
+
+        it('skips the multi-sampled 32bit float formats on WebGPU', function () {
+            device.isWebGPU = true;
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R32F, PIXELFORMAT_R16F], false, 4)).to.equal(PIXELFORMAT_R16F);
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R32F], false, 4)).to.be.undefined;
+        });
+
+        it('returns undefined when no format in the list is renderable', function () {
+            device.textureFloatRenderable = false;
+            device.textureHalfFloatRenderable = false;
+            expect(device.getRenderableHdrFormat([PIXELFORMAT_R32F, PIXELFORMAT_R16F], false)).to.be.undefined;
+        });
+    });
+});

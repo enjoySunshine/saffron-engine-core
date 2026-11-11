@@ -1,0 +1,834 @@
+import { path } from '../../core/path.js';
+import { Tags } from '../../core/tags.js';
+import { EventHandler } from '../../core/event-handler.js';
+import { findAvailableLocale } from '../i18n/utils.js';
+import { ABSOLUTE_URL } from './constants.js';
+import { AssetFile } from './asset-file.js';
+import { getApplication } from '../globals.js';
+import { http } from '../../platform/net/http.js';
+
+/**
+ * @import { AnimStateGraph } from '../anim/state-graph/anim-state-graph.js'
+ * @import { AnimTrack } from '../anim/evaluator/anim-track.js'
+ * @import { Animation } from '../../scene/animation/animation.js'
+ * @import { AssetRegistry } from './asset-registry.js'
+ * @import { Bundle } from '../bundle/bundle.js'
+ * @import { CanvasFont } from '../font/canvas-font.js'
+ * @import { ContainerResource } from '../handlers/container.js'
+ * @import { Entity } from '../entity.js'
+ * @import { Font } from '../font/font.js'
+ * @import { GSplatOctreeResource } from '../../scene/gsplat-unified/gsplat-octree.resource.js'
+ * @import { GSplatResourceBase } from '../../scene/gsplat/gsplat-resource-base.js'
+ * @import { Material } from '../../scene/materials/material.js'
+ * @import { Model } from '../../scene/model.js'
+ * @import { Render } from '../../scene/render.js'
+ * @import { ResourceLoaderCallback } from '../handlers/loader.js'
+ * @import { Scene } from '../../scene/scene.js'
+ * @import { Script } from '../script/script.js'
+ * @import { Sound } from '../../platform/sound/sound.js'
+ * @import { Sprite } from '../../scene/sprite.js'
+ * @import { Template } from '../template.js'
+ * @import { Texture } from '../../platform/graphics/texture.js'
+ * @import { TextureAtlas } from '../../scene/texture-atlas.js'
+ */
+
+// auto incrementing number for asset ids
+let assetIdCounter = -1;
+
+const VARIANT_SUPPORT = {
+    pvr: 'extCompressedTexturePVRTC',
+    dxt: 'extCompressedTextureS3TC',
+    etc2: 'extCompressedTextureETC',
+    etc1: 'extCompressedTextureETC1',
+    basis: 'canvas' // dummy, basis is always supported
+};
+
+const VARIANT_DEFAULT_PRIORITY = ['pvr', 'dxt', 'etc2', 'etc1', 'basis'];
+
+/**
+ * The resource each asset type loads, keyed by the `type` string passed to the {@link Asset}
+ * constructor and to {@link AssetRegistry#find}: `'texture'` maps to {@link Texture}, `'material'`
+ * to {@link Material} and so on. This is what types {@link Asset#resource}: an `Asset<'texture'>`
+ * holds a {@link Texture}. An application that registers its own resource handler with
+ * {@link ResourceLoader#addHandler} extends the map - and with it the typing of
+ * {@link Asset#resource}, {@link AssetRegistry#find}, {@link AssetRegistry#findAll} and
+ * {@link AssetRegistry#loadFromUrl} - by augmenting this interface:
+ *
+ * ```ts
+ * declare module 'playcanvas' {
+ *     interface AssetMap {
+ *         mytype: MyResource;
+ *     }
+ * }
+ * ```
+ *
+ * @typedef {object} AssetMap
+ * @property {Animation | AnimTrack} animation - An animation: an {@link AnimTrack} when loaded from
+ * a glTF or GLB file, or a legacy {@link Animation} when loaded from JSON.
+ * @property {AnimTrack} animclip - An animation clip.
+ * @property {AnimStateGraph} animstategraph - An animation state graph.
+ * @property {Sound} audio - A sound.
+ * @property {ArrayBuffer} binary - The raw contents of the file.
+ * @property {Bundle} bundle - A bundle: an archive whose files back other assets.
+ * @property {ContainerResource} container - The renders, materials, textures, animations and
+ * gsplats of a glTF or GLB file.
+ * @property {string} css - The CSS text.
+ * @property {Texture | null} cubemap - The cube map, or null when the asset provides only prefiltered
+ * levels. {@link Asset#resources} holds the cube map followed by its six prefiltered levels, with
+ * null for each level the asset does not provide.
+ * @property {null} folder - Folders hold no resource.
+ * @property {Font | CanvasFont} font - A {@link Font} loaded from a font file.
+ * @property {GSplatResourceBase | GSplatOctreeResource} gsplat - A Gaussian splat resource, or the
+ * octree resource of a level-of-detail splat scene.
+ * @property {Entity} hierarchy - The root entity of an instantiated scene hierarchy.
+ * @property {string} html - The HTML text.
+ * @property {unknown} json - The parsed JSON data.
+ * @property {Material} material - A material, a {@link StandardMaterial} unless a custom parser
+ * creates another kind.
+ * @property {Model} model - A model.
+ * @property {Render} render - The meshes of one glTF mesh, created when a container asset loads.
+ * @property {Scene} scene - A scene.
+ * @property {object} scenesettings - The settings block of a scene file.
+ * @property {Record<string, typeof Script>} script - The script classes declared by a script file,
+ * keyed by class name.
+ * @property {string} shader - The shader source text.
+ * @property {Sprite} sprite - A sprite.
+ * @property {Template} template - A template.
+ * @property {string} text - The text of the file.
+ * @property {Texture} texture - A texture.
+ * @property {TextureAtlas} textureatlas - A texture atlas.
+ */
+
+// Spelled `keyof AssetMap & string` rather than `keyof AssetMap` on purpose: the intersection gives
+// the resulting union its own identity, which carries this alias, so hovers and the API reference
+// show `AssetType` instead of the expanded list of names. Every key is a string, so the two
+// spellings denote the same type.
+/**
+ * The type of an {@link Asset}, such as `'texture'` or `'material'`: the keys of {@link AssetMap}.
+ * This is what the {@link Asset} constructor, {@link AssetRegistry#find},
+ * {@link AssetRegistry#findAll} and {@link AssetRegistry#loadFromUrl} take, and what
+ * {@link AssetResource} is indexed by.
+ *
+ * @typedef {keyof AssetMap & string} AssetType
+ */
+
+/**
+ * The resource an {@link Asset} holds for its `Type`: `AssetMap[Type]` for a type in
+ * {@link AssetMap}, so `AssetResource<'texture'>` is {@link Texture}, and `unknown` for any other
+ * string, including a plain `string`. This is the type of {@link Asset#resource}.
+ *
+ * @template {AssetType | (string & {})} Type
+ * @typedef {Type extends AssetType ? AssetMap[Type] : unknown} AssetResource
+ */
+
+/**
+ * @template {AssetType | (string & {})} [Type=string]
+ * @template [Resource=AssetResource<Type>]
+ * @callback AssetReadyCallback
+ * Callback used by {@link Asset#ready} and called when an asset is ready.
+ * @param {Asset<Type, Resource>} asset - The ready asset.
+ * @returns {void}
+ */
+
+/**
+ * An Asset is the engine's record of a single resource: a texture, a material, a glTF container, a
+ * sound, a script and so on. Assets live in the application's {@link AssetRegistry} at
+ * {@link AppBase#assets}, which loads them on demand.
+ *
+ * An asset has five parts:
+ *
+ * - `type` selects the {@link ResourceHandler} that loads it and the type of `resource`.
+ * - `file` names the file that holds the data, when there is one.
+ * - `data` carries JSON that either is the resource, as for materials, or describes how to process
+ * the file, as for texture and model mappings.
+ * - `options` carries handler-specific load options.
+ * - `resource` holds the loaded object, such as a {@link Texture}. `resources` holds every object
+ * the handler produced when there is more than one, such as a cube map and its prefiltered levels.
+ *
+ * Loading is driven by the registry: call {@link AssetRegistry#load}, or set {@link preload} so the
+ * asset loads when added. Wait for the result with {@link ready} or listen for the `load` and
+ * `error` events. {@link unload} releases the resource.
+ *
+ * The `type` string also types the resource: `new Asset('brick', 'texture', file)` creates an
+ * `Asset<'texture'>` whose `resource` is a {@link Texture} once loaded, and
+ * `app.assets.find('brick', 'texture')` returns one. See {@link AssetMap} for the built-in types
+ * and for adding application-defined ones. An asset whose type is only known as a `string` has a
+ * `resource` of type `unknown`. The optional second type parameter narrows the resource further
+ * where more is known than the type string says: the animations of a {@link ContainerResource} are
+ * `Asset<'animation', AnimTrack>`, because a container never holds a legacy {@link Animation}.
+ *
+ * @example
+ * const asset = new Asset('brick', 'texture', { url: 'textures/brick.png' });
+ * app.assets.add(asset);
+ * app.assets.load(asset);
+ * asset.ready((asset) => {
+ *     material.diffuseMap = asset.resource;
+ * });
+ * @template {AssetType | (string & {})} [Type=string]
+ * @template [Resource=AssetResource<Type>]
+ * @category Asset
+ */
+class Asset extends EventHandler {
+    /**
+     * Fired when the asset has completed loading.
+     *
+     * @event
+     * @example
+     * asset.on('load', (asset) => {
+     *     console.log(`Asset loaded: ${asset.name}`);
+     * });
+     */
+    static EVENT_LOAD = 'load';
+
+    /**
+     * Fired just before the asset unloads the resource. This allows for the opportunity to prepare
+     * for an asset that will be unloaded. E.g. Changing the texture of a model to a default before
+     * the one it was using is unloaded.
+     *
+     * @event
+     * @example
+     * asset.on('unload', (asset) => {
+     *    console.log(`Asset about to unload: ${asset.name}`);
+     * });
+     */
+    static EVENT_UNLOAD = 'unload';
+
+    /**
+     * Fired when the asset is removed from the asset registry.
+     *
+     * @event
+     * @example
+     * asset.on('remove', (asset) => {
+     *    console.log(`Asset removed: ${asset.name}`);
+     * });
+     */
+    static EVENT_REMOVE = 'remove';
+
+    /**
+     * Fired if the asset encounters an error while loading.
+     *
+     * @event
+     * @example
+     * asset.on('error', (err, asset) => {
+     *    console.error(`Error loading asset ${asset.name}: ${err}`);
+     * });
+     */
+    static EVENT_ERROR = 'error';
+
+    /**
+     * Fired when one of the asset properties `file`, `data`, `resource` or `resources` is changed.
+     *
+     * @event
+     * @example
+     * asset.on('change', (asset, property, newValue, oldValue) => {
+     *    console.log(`Asset ${asset.name} has property ${property} changed from ${oldValue} to ${newValue}`);
+     * });
+     */
+    static EVENT_CHANGE = 'change';
+
+    /**
+     * Fired as the asset's file downloads, with the number of bytes received so far and the total
+     * expected. Only asset types whose file is fetched as binary data report progress:
+     * `animation` (GLB only), `audio`, `binary`, `container`, `gsplat`, `model` and `texture`.
+     * Textures loaded through an image element have no download progress, so they fire once at 0
+     * and once at a fixed placeholder total, whether or not the file was downloaded.
+     *
+     * Please note:
+     * - downloads are skipped when `asset.file.contents` is supplied, so no progress is reported
+     * - totalBytes may not be reliable as it is based on the content-length header of the response
+     *
+     * @event
+     * @example
+     * asset.on('progress', (receivedBytes, totalBytes) => {
+     *    console.log(`Asset ${asset.name} progress ${receivedBytes / totalBytes}`);
+     * });
+     */
+    static EVENT_PROGRESS = 'progress';
+
+    /**
+     * Fired when we add a new localized asset id to the asset.
+     *
+     * @event
+     * @example
+     * asset.on('add:localized', (locale, assetId) => {
+     *    console.log(`Asset ${asset.name} has added localized asset ${assetId} for locale ${locale}`);
+     * });
+     */
+    static EVENT_ADDLOCALIZED = 'add:localized';
+
+    /**
+     * Fired when we remove a localized asset id from the asset.
+     *
+     * @event
+     * @example
+     * asset.on('remove:localized', (locale, assetId) => {
+     *   console.log(`Asset ${asset.name} has removed localized asset ${assetId} for locale ${locale}`);
+     * });
+     */
+    static EVENT_REMOVELOCALIZED = 'remove:localized';
+
+    /**
+     * @type {AssetFile | null}
+     * @private
+     */
+    _file = null;
+
+    /**
+     * A string-assetId dictionary that maps locale to asset id.
+     *
+     * @type {object}
+     * @private
+     */
+    _i18n = {};
+
+    /**
+     * Whether to preload the asset.
+     *
+     * @private
+     */
+    _preload = false;
+
+    /**
+     * This is where the loaded resource(s) are stored.
+     *
+     * @type {Resource[]}
+     * @private
+     */
+    _resources = [];
+
+    /**
+     * The asset id.
+     *
+     * @type {number}
+     */
+    id = assetIdCounter--;
+
+    /**
+     * True if the asset has finished attempting to load the resource. It is not guaranteed
+     * that the resources are available as there could have been a network error.
+     */
+    loaded = false;
+
+    /**
+     * True if the resource is currently being loaded.
+     */
+    loading = false;
+
+    /**
+     * The error the asset's last load from a URL failed with, which
+     * {@link AssetRegistry#loadFromUrl} reports again when the URL is requested again, or null.
+     * A successful load, however it was asked for, and unloading clear it.
+     *
+     * @type {*}
+     * @ignore
+     */
+    loadFromUrlError = null;
+
+    /**
+     * Optional JSON data that contains the asset handler options.
+     *
+     * @type {object}
+     */
+    options = {};
+
+    /**
+     * The asset registry that this Asset belongs to.
+     *
+     * @type {AssetRegistry|null}
+     */
+    registry = null;
+
+    /**
+     * Asset tags. Enables finding of assets by tags using the {@link AssetRegistry#findByTag} method.
+     *
+     * @type {Tags}
+     */
+    tags = new Tags(this);
+
+    /**
+     * The type of the asset: one of the {@link AssetType} names, or the name of an
+     * application-defined resource handler. See {@link AssetMap}.
+     *
+     * @type {Type}
+     */
+    type;
+
+    /**
+     * The URL object.
+     *
+     * @type {string | null}
+     * @ignore
+     */
+    urlObject = null;
+
+    /**
+     * Create a new Asset record. Add it to the {@link AssetRegistry} with
+     * {@link AssetRegistry#add} so the application can find and load it.
+     *
+     * @param {string} name - A non-unique but human-readable name which can be later used to
+     * retrieve the asset.
+     * @param {Type} type - The type of asset (an {@link AssetType}), which selects the resource
+     * handler and the type of {@link Asset#resource}. The types a developer commonly creates are:
+     *
+     * - "animation" - see {@link Animation} and {@link AnimTrack}
+     * - "animclip" - see {@link AnimTrack}
+     * - "animstategraph" - see {@link AnimStateGraph}
+     * - "audio" - see {@link Sound}
+     * - "binary" - an `ArrayBuffer`
+     * - "container" - see {@link ContainerResource}
+     * - "css" - a `string`
+     * - "cubemap" - see {@link Texture}; null when only prefiltered levels are provided
+     * - "font" - see {@link Font}
+     * - "gsplat" - a Gaussian splat resource
+     * - "html" - a `string`
+     * - "json" - the parsed JSON
+     * - "material" - see {@link Material}
+     * - "model" - see {@link Model}
+     * - "script" - see {@link Script}
+     * - "shader" - a `string`
+     * - "sprite" - see {@link Sprite}
+     * - "text" - a `string`
+     * - "texture" - see {@link Texture}
+     * - "textureatlas" - see {@link TextureAtlas}
+     *
+     * Types that the engine creates itself while loading, such as `render` or `scene`, are omitted
+     * here; every built-in type is listed in {@link AssetMap}. Any other string is accepted for an
+     * application-defined handler; see {@link AssetMap} for typing its resource.
+     * @param {object} [file] - Details about the file the asset is made from. At the least must
+     * contain the 'url' field. For assets that don't contain file data use null.
+     * @param {string} [file.url] - The URL of the resource file that contains the asset data.
+     * @param {string} [file.filename] - The filename of the resource file or null if no filename
+     * was set (e.g from using {@link AssetRegistry#loadFromUrl}).
+     * @param {number} [file.size] - The size of the resource file or null if no size was set
+     * (e.g. from using {@link AssetRegistry#loadFromUrl}).
+     * @param {string} [file.hash] - The MD5 hash of the resource file data and the Asset data
+     * field or null if hash was set (e.g from using {@link AssetRegistry#loadFromUrl}).
+     * @param {ArrayBuffer} [file.contents] - Optional file contents. This is faster than wrapping
+     * the data in a (base64 encoded) blob. Currently only used by container assets.
+     * @param {object|string} [data] - JSON object or string with additional data about the asset.
+     * (e.g. for texture and model assets) or contains the asset data itself (e.g. in the case of
+     * materials).
+     * @param {object} [options] - The asset handler options. For container options see
+     * {@link ContainerHandler}.
+     * @param {'anonymous'|'use-credentials'|null} [options.crossOrigin] - For use with texture assets
+     * that are loaded using the browser. This setting overrides the default crossOrigin specifier.
+     * For more details on crossOrigin and its use, see
+     * https://developer.mozilla.org/en-US/docs/Web/API/HTMLImageElement/crossOrigin.
+     * @example
+     * // an Asset<'texture'>: once loaded, asset.resource is a Texture
+     * const asset = new Asset("a texture", "texture", {
+     *     url: "http://example.com/my/assets/here/texture.png"
+     * });
+     */
+    constructor(name, type, file, data = {}, options = {}) {
+        super();
+
+        this._name = name || '';
+        this.type = type;
+        this._data = data || {};
+        this.options = options || {};
+
+        if (file) this.file = file;
+    }
+
+    /**
+     * Sets the asset name.
+     *
+     * @type {string}
+     */
+    set name(value) {
+        if (this._name === value) {
+            return;
+        }
+        const old = this._name;
+        this._name = value;
+        this.fire('name', this, this._name, old);
+    }
+
+    /**
+     * Gets the asset name.
+     *
+     * @type {string}
+     */
+    get name() {
+        return this._name;
+    }
+
+    /**
+     * Sets the file details or null if no file.
+     *
+     * @type {object}
+     */
+    set file(value) {
+        // if value contains variants, choose the correct variant first
+        if (value && value.variants && ['texture', 'textureatlas', 'bundle'].indexOf(this.type) !== -1) {
+            // search for active variant
+            const app = this.registry?._loader?._app || getApplication();
+            const device = app?.graphicsDevice;
+            if (device) {
+                for (let i = 0, len = VARIANT_DEFAULT_PRIORITY.length; i < len; i++) {
+                    const variant = VARIANT_DEFAULT_PRIORITY[i];
+                    // if the device supports the variant
+                    if (value.variants[variant] && device[VARIANT_SUPPORT[variant]]) {
+                        value = value.variants[variant];
+                        break;
+                    }
+
+                    // if the variant does not exist but the asset is in a bundle
+                    // and the bundle contain assets with this variant then return the default
+                    // file for the asset
+                    if (app.enableBundles) {
+                        const bundles = app.bundles.listBundlesForAsset(this);
+                        if (bundles && bundles.find((b) => {
+                            return b?.file?.variants[variant];
+                        })) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        const oldFile = this._file;
+        const newFile = value ? new AssetFile(value.url, value.filename, value.hash, value.size, value.opt, value.contents) : null;
+
+        if (!!newFile !== !!oldFile || (newFile && !newFile.equals(oldFile))) {
+            this._file = newFile;
+            this.fire('change', this, 'file', newFile, oldFile);
+            this.reload();
+        }
+    }
+
+    /**
+     * Gets the file details or null if no file.
+     *
+     * @type {object}
+     */
+    get file() {
+        return this._file;
+    }
+
+    /**
+     * Sets optional asset JSON data. This contains either the complete resource data (such as in
+     * the case of a material) or additional data (such as in the case of a model which contains
+     * mappings from mesh to material).
+     *
+     * @type {object}
+     */
+    set data(value) {
+        // fire change event when data changes
+        // because the asset might need reloading if that happens
+        const old = this._data;
+        this._data = value;
+        if (value !== old) {
+            this.fire('change', this, 'data', value, old);
+
+            if (this.loaded) {
+                this.registry._loader.patch(this, this.registry);
+            }
+        }
+    }
+
+    /**
+     * Gets optional asset JSON data.
+     *
+     * @type {object}
+     */
+    get data() {
+        return this._data;
+    }
+
+    /**
+     * Sets the asset resource. For example, a {@link StandardMaterial} or a {@link Texture}. The
+     * value is checked against the asset's type. As with the elements of an array, the check is
+     * bypassed when assigning through a variable typed as a plain `Asset`, so keep typed assets
+     * typed where their resource is assigned.
+     *
+     * @param {Resource} value - The resource.
+     */
+    set resource(value) {
+        const _old = this._resources[0];
+        this._resources[0] = value;
+        this.fire('change', this, 'resource', value, _old);
+    }
+
+    /**
+     * Gets the asset resource. Its type follows the asset's type: a {@link Texture} for an
+     * `Asset<'texture'>`, a {@link Material} for an `Asset<'material'>` and so on (see
+     * {@link AssetMap}), or `unknown` when the type is only known as a `string`. It is `undefined`
+     * until the asset has loaded and after {@link Asset#unload}, so narrow it before use unless the
+     * asset is known to be loaded, for example inside {@link Asset#ready}.
+     *
+     * @type {Resource | undefined}
+     */
+    get resource() {
+        return this._resources[0];
+    }
+
+    /**
+     * Sets the asset resources. Some assets can hold more than one runtime resource (cube maps,
+     * for example).
+     *
+     * @type {Resource[]}
+     */
+    set resources(value) {
+        const _old = this._resources;
+        this._resources = value;
+        this.fire('change', this, 'resources', value, _old);
+    }
+
+    /**
+     * Gets the asset resources. For a cube map asset, the first entry is the cube map and the
+     * remaining entries are its prefiltered levels, some of which may be `null`.
+     *
+     * @type {Resource[]}
+     */
+    get resources() {
+        return this._resources;
+    }
+
+    /**
+     * Sets whether to preload an asset. If true, the asset will be loaded during the preload phase
+     * of application initialization or when calling {@link AssetRegistry#add}.
+     *
+     * @type {boolean}
+     */
+    set preload(value) {
+        value = !!value;
+        if (this._preload === value) {
+            return;
+        }
+
+        this._preload = value;
+        if (this._preload && !this.loaded && !this.loading && this.registry) {
+            this.registry.load(this);
+        }
+    }
+
+    /**
+     * Gets whether to preload an asset.
+     *
+     * @type {boolean}
+     */
+    get preload() {
+        return this._preload;
+    }
+
+    set loadFaces(value) {
+        value = !!value;
+        if (!this.hasOwnProperty('_loadFaces') || value !== this._loadFaces) {
+            this._loadFaces = value;
+
+            // the loadFaces property should be part of the asset data block
+            // because changing the flag should result in asset patch being invoked.
+            // here we must invoke it manually instead.
+            if (this.loaded) {
+                this.registry._loader.patch(this, this.registry);
+            }
+        }
+    }
+
+    get loadFaces() {
+        return this._loadFaces;
+    }
+
+    /**
+     * Return the URL required to fetch the file for this asset.
+     *
+     * @returns {string|null} The URL. Returns null if the asset has no associated file.
+     * @example
+     * const asset = app.assets.find("My Image", "texture");
+     * const img = "&lt;img src='" + asset.getFileUrl() + "'&gt;";
+     */
+    getFileUrl() {
+        const file = this.file;
+
+        if (!file || !file.url) {
+            return null;
+        }
+
+        let url = file.url;
+
+        if (this.registry && this.registry.prefix && !ABSOLUTE_URL.test(url)) {
+            url = this.registry.prefix + url;
+        }
+
+        // add file hash to avoid hard-caching problems
+        if (this.type !== 'script' && file.hash) {
+            const separator = url.indexOf('?') !== -1 ? '&' : '?';
+            url += `${separator}t=${file.hash}`;
+        }
+
+        return url;
+    }
+
+    /**
+     * Construct an asset URL from this asset's location and a relative path. If the relativePath
+     * is a blob or Base64 URI, then return that instead.
+     *
+     * @param {string} relativePath - The relative path to be concatenated to this asset's base url.
+     * @returns {string} Resulting URL of the asset.
+     * @ignore
+     */
+    getAbsoluteUrl(relativePath) {
+        if (relativePath.startsWith('blob:') || relativePath.startsWith('data:')) {
+            return relativePath;
+        }
+
+        const base = path.getDirectory(this.file.url);
+        return path.join(base, relativePath);
+    }
+
+    /**
+     * Returns the asset id of the asset that corresponds to the specified locale.
+     *
+     * @param {string} locale - The desired locale e.g. Ar-AR.
+     * @returns {number} An asset id or null if there is no asset specified for the desired locale.
+     * @ignore
+     */
+    getLocalizedAssetId(locale) {
+        // tries to find either the desired locale or a fallback locale
+        locale = findAvailableLocale(locale, this._i18n);
+        return this._i18n[locale] || null;
+    }
+
+    /**
+     * Adds a replacement asset id for the specified locale. When the locale in
+     * {@link AppBase#i18n} changes then references to this asset will be replaced with the
+     * specified asset id. (Currently only supported by the {@link ElementComponent}).
+     *
+     * @param {string} locale - The locale e.g. Ar-AR.
+     * @param {number} assetId - The asset id.
+     * @ignore
+     */
+    addLocalizedAssetId(locale, assetId) {
+        this._i18n[locale] = assetId;
+        this.fire('add:localized', locale, assetId);
+    }
+
+    /**
+     * Removes a localized asset.
+     *
+     * @param {string} locale - The locale e.g. Ar-AR.
+     * @ignore
+     */
+    removeLocalizedAssetId(locale) {
+        const assetId = this._i18n[locale];
+        if (assetId) {
+            delete this._i18n[locale];
+            this.fire('remove:localized', locale, assetId);
+        }
+    }
+
+    /**
+     * Take a callback which is called as soon as the asset is loaded. If the asset is already
+     * loaded the callback is called straight away.
+     *
+     * The callback fires on success only, and a failed load still marks the asset as loaded while
+     * firing `error` rather than `load`. So a callback registered before the failure never runs,
+     * and one registered after it runs immediately with {@link Asset#resource} still null. Listen
+     * for the `error` event as well whenever a failure has to be handled, check `asset.resource`
+     * inside the callback, and never await this callback alone.
+     *
+     * @param {AssetReadyCallback<Type, Resource>} callback - The function called when the asset is ready. Passed
+     * the (asset) arguments.
+     * @param {object} [scope] - Scope object to use when calling the callback.
+     * @example
+     * const asset = app.assets.find("My Asset");
+     * asset.ready((asset) => {
+     *     // asset loaded
+     * });
+     * app.assets.load(asset);
+     */
+    ready(callback, scope) {
+        scope = scope || this;
+
+        if (this.loaded) {
+            callback.call(scope, this);
+        } else {
+            this.once('load', (asset) => {
+                callback.call(scope, asset);
+            });
+        }
+    }
+
+    reload() {
+        // no need to be reloaded
+        if (this.loaded) {
+            this.loaded = false;
+            this.registry.load(this);
+        }
+    }
+
+    /**
+     * Destroys the associated resource and marks asset as unloaded.
+     * The `unload` event also fires while the asset is loading, allowing resource handlers to
+     * cancel pending work.
+     *
+     * @example
+     * const asset = app.assets.find("My Asset");
+     * asset.unload();
+     * // asset.resource is null
+     */
+    unload() {
+        if (!this.loaded && !this.loading && this._resources.length === 0) {
+            return;
+        }
+
+        this.fire('unload', this);
+        this.registry?.fire(`unload:${this.id}`, this);
+
+        const old = /** @type {any[]} */ (this._resources);
+
+        if (this.urlObject) {
+            URL.revokeObjectURL(this.urlObject);
+            this.urlObject = null;
+        }
+
+        // clear resources on the asset
+        this.resources = [];
+        this.loaded = false;
+        this.loadFromUrlError = null;
+
+        // remove resource from loader cache
+        if (this.file) {
+            this.registry?._loader.clearCache(this.getFileUrl(), this.type);
+        }
+
+        // destroy resources
+        for (let i = 0; i < old.length; ++i) {
+            old[i]?.destroy?.();
+        }
+    }
+
+    /**
+     * Helper function to resolve asset file data and return the contents as an ArrayBuffer. If the
+     * asset file contents are present, that is returned. Otherwise the file data is be downloaded
+     * via http.
+     *
+     * @param {string} loadUrl - The URL as passed into the handler
+     * @param {ResourceLoaderCallback} callback - The callback function to receive results.
+     * @param {Asset} [asset] - The asset
+     * @param {number} maxRetries - Number of retries if http download is required
+     * @ignore
+     */
+    static fetchArrayBuffer(loadUrl, callback, asset, maxRetries = 0) {
+        if (asset?.file?.contents) {
+            // asset file contents were provided
+            setTimeout(() => {
+                callback(null, asset.file.contents);
+            });
+        } else {
+            // asset contents must be downloaded
+            http.get(loadUrl, {
+                cache: true,
+                responseType: 'arraybuffer',
+                retry: maxRetries > 0,
+                maxRetries: maxRetries,
+                progress: asset
+            }, callback);
+        }
+    }
+}
+
+export { Asset };

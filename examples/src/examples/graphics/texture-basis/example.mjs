@@ -1,0 +1,153 @@
+import {
+    AppBase,
+    AppOptions,
+    Asset,
+    AssetListLoader,
+    CameraComponentSystem,
+    Color,
+    ContainerHandler,
+    Entity,
+    FILLMODE_FILL_WINDOW,
+    LightComponentSystem,
+    Mesh,
+    MeshInstance,
+    RESOLUTION_AUTO,
+    RenderComponentSystem,
+    StandardMaterial,
+    TEXTURETYPE_RGBP,
+    TEXTURETYPE_SWIZZLEGGGR,
+    TONEMAP_ACES,
+    TextureHandler,
+    TorusGeometry,
+    basisInitialize,
+    createGraphicsDevice
+} from 'playcanvas';
+
+import { deviceType } from 'examples/context';
+
+const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('application-canvas'));
+window.focus();
+
+// Initialize basis
+basisInitialize({
+    glueUrl: './assets/wasm/basis/basis.wasm.js',
+    wasmUrl: './assets/wasm/basis/basis.wasm.wasm',
+    fallbackUrl: './assets/wasm/basis/basis.js'
+});
+
+const assets = {
+    color: new Asset('color', 'texture', { url: './assets/textures/seaside-rocks01-color.basis' }, { srgb: true }),
+    gloss: new Asset('gloss', 'texture', { url: './assets/textures/seaside-rocks01-gloss.basis' }),
+    normal: new Asset(
+        'normal',
+        'texture',
+        { url: './assets/textures/seaside-rocks01-normal.basis' },
+        { type: TEXTURETYPE_SWIZZLEGGGR }
+    ),
+    helipad: new Asset(
+        'helipad-env-atlas',
+        'texture',
+        { url: './assets/cubemaps/helipad-env-atlas.png' },
+        { type: TEXTURETYPE_RGBP, mipmaps: false }
+    )
+};
+
+const gfxOptions = {
+    deviceTypes: [deviceType]
+};
+
+const device = await createGraphicsDevice(canvas, gfxOptions);
+device.maxPixelRatio = Math.min(window.devicePixelRatio, 2);
+
+const createOptions = new AppOptions();
+createOptions.graphicsDevice = device;
+
+createOptions.componentSystems = [RenderComponentSystem, CameraComponentSystem, LightComponentSystem];
+createOptions.resourceHandlers = [TextureHandler, ContainerHandler];
+
+const app = new AppBase(canvas);
+app.init(createOptions);
+
+// Set the canvas to fill the window and automatically change resolution to be the same as the canvas size
+app.setCanvasFillMode(FILLMODE_FILL_WINDOW);
+app.setCanvasResolution(RESOLUTION_AUTO);
+
+// Ensure canvas is resized when window changes size
+const resize = () => app.resizeCanvas();
+window.addEventListener('resize', resize);
+app.on('destroy', () => {
+    window.removeEventListener('resize', resize);
+});
+
+await new Promise((resolve) => {
+    new AssetListLoader(Object.values(assets), app.assets).load(resolve);
+});
+
+app.start();
+
+// Set skybox
+app.scene.skyboxMip = 1;
+app.scene.skyboxIntensity = 1.4;
+app.scene.envAtlas = assets.helipad.resource;
+
+// Create directional light
+const light = new Entity();
+light.addComponent('light', {
+    type: 'directional'
+});
+light.setLocalEulerAngles(45, 0, 45);
+
+// Construct material
+const material = new StandardMaterial();
+material.useMetalness = true;
+material.gloss = 0.8;
+material.metalness = 0.7;
+material.diffuseMap = assets.color.resource;
+material.normalMap = assets.normal.resource;
+material.glossMap = assets.gloss.resource;
+material.diffuseMapTiling.set(7, 7);
+material.normalMapTiling.set(7, 7);
+material.glossMapTiling.set(7, 7);
+material.update();
+
+// Create a torus shape
+const torus = Mesh.fromGeometry(
+    app.graphicsDevice,
+    new TorusGeometry({
+        tubeRadius: 0.2,
+        ringRadius: 0.3,
+        segments: 50,
+        sides: 40
+    })
+);
+const shape = new Entity();
+shape.addComponent('render', {
+    material: material,
+    meshInstances: [new MeshInstance(torus, material)]
+});
+shape.setPosition(0, 0, 0);
+shape.setLocalScale(2, 2, 2);
+
+// Create an Entity with a camera component
+const camera = new Entity();
+camera.addComponent('camera', {
+    clearColor: new Color(0.4, 0.45, 0.5),
+    toneMapping: TONEMAP_ACES
+});
+
+// Adjust the camera position
+camera.translate(0, 0, 4);
+
+// Add the new Entities to the hierarchy
+app.root.addChild(light);
+app.root.addChild(shape);
+app.root.addChild(camera);
+
+// Set an update function on the app's update event
+let angle = 0;
+app.on('update', (dt) => {
+    angle = (angle + dt * 10) % 360;
+
+    // Rotate the boxes
+    shape.setEulerAngles(angle, angle * 2, angle * 4);
+});

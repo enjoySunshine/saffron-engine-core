@@ -1,0 +1,358 @@
+import { TRACEID_SHADER_ALLOC } from '../../core/constants.js';
+import { Debug } from '../../core/debug.js';
+import { platform } from '../../core/platform.js';
+import { Preprocessor } from '../../core/preprocessor.js';
+import { SHADERLANGUAGE_GLSL, SHADERLANGUAGE_WGSL } from './constants.js';
+import { DebugGraphics } from './debug-graphics.js';
+import { ShaderDefinitionUtils } from './shader-definition-utils.js';
+import halfTypes from './shader-chunks/frag/half-types.js';
+import dispatchThreadsCS from './shader-chunks/compute/dispatch-threads.js';
+import sceneColorCS from './shader-chunks/compute/scene-color.js';
+import sceneDepthCS from './shader-chunks/compute/scene-depth.js';
+
+/**
+ * @import { BindGroupFormat } from './bind-group-format.js'
+ * @import { TRANSFORM_FEEDBACK_INTERLEAVED, TRANSFORM_FEEDBACK_SEPARATE } from './constants.js'
+ * @import { GraphicsDevice } from './graphics-device.js'
+ * @import { UniformBufferFormat } from './uniform-buffer-format.js'
+ */
+
+let id = 0;
+
+/**
+ * A shader is a program that is responsible for rendering graphical primitives on a device's
+ * graphics processor. The shader is generated from a shader definition. This shader definition
+ * specifies the code for processing vertices and fragments processed by the GPU. The language of
+ * the code is GLSL (or more specifically ESSL, the OpenGL ES Shading Language). The shader
+ * definition also describes how the PlayCanvas engine should map vertex buffer elements onto the
+ * attributes specified in the vertex shader code.
+ *
+ * @category Graphics
+ */
+class Shader {
+    /**
+     * The definition of a compute shader as supplied, before its source is pre-processed, or null
+     * for a vertex and fragment shader. Variants of the compute shader, compiled with additional
+     * defines, are created from it.
+     *
+     * @type {object|null}
+     * @ignore
+     */
+    computeDefinition = null;
+
+    /**
+     * Format of the uniform buffer for mesh bind group.
+     *
+     * @type {UniformBufferFormat}
+     * @ignore
+     */
+    meshUniformBufferFormat;
+
+    /**
+     * True when the mesh uniform buffer holds no uniforms of the shader, only a placeholder, as
+     * WebGPU requires the buffer bound. Its draws can share one buffer, bound once per pass.
+     *
+     * @type {boolean}
+     * @ignore
+     */
+    meshUniformBufferEmpty = false;
+
+    /**
+     * Format of the bind group for the mesh bind group.
+     *
+     * @type {BindGroupFormat}
+     * @ignore
+     */
+    meshBindGroupFormat;
+
+    /**
+     * Format of the view bind group when the shader reads textures the renderer supplies per pass
+     * in it, following the view uniform buffer, or null when the group holds only the view uniform
+     * buffer. The format is shared by all shaders reading the same textures, and is not owned by
+     * the shader.
+     *
+     * @type {BindGroupFormat|null}
+     * @ignore
+     */
+    viewBindGroupFormat = null;
+
+    /**
+     * True when the vertex shader reads the model and normal matrices of the mesh instance from the
+     * mesh instance storage of the device, see {@link GraphicsDevice#meshInstanceStorage}, indexed
+     * by the instance index. The draws of such a shader pass the slot of the mesh instance as the
+     * first instance.
+     *
+     * @type {boolean}
+     * @ignore
+     */
+    usesMeshInstanceStorage = false;
+
+    /**
+     * The attributes that this shader code uses. The location is the key, the value is the name.
+     * These attributes are queried / extracted from the final shader.
+     *
+     * @type {Map<number, string>}
+     * @ignore
+     */
+    attributes = new Map();
+
+    // #if _DEBUG
+    /**
+     * Set by the shadow renderer once it has checked whether the shader reads the normal matrix,
+     * which the shadow pass does not supply. Debug builds only.
+     *
+     * @type {boolean}
+     * @private
+     */
+    _debugNormalMatrixChecked = false;
+    // #endif
+
+    /**
+     * Creates a new Shader instance.
+     *
+     * Consider {@link ShaderUtils.createShader} as a simpler and more powerful way to create
+     * a shader.
+     *
+     * @param {GraphicsDevice} graphicsDevice - The graphics device used to manage this shader.
+     * @param {object} definition - The shader definition from which to build the shader.
+     * @param {string} [definition.name] - The name of the shader.
+     * @param {Object<string, string>} [definition.attributes] - Object detailing the mapping of
+     * vertex shader attribute names to semantics SEMANTIC_*. This enables the engine to match
+     * vertex buffer data as inputs to the shader. When not specified, rendering without vertex
+     * buffer is assumed.
+     * @param {string[]} [definition.feedbackVaryings] - A list of shader output variable
+     * names that will be captured when using transform feedback. This setting is only effective
+     * if the useTransformFeedback property is enabled.
+     * @param {number} [definition.feedbackVaryingsMode] - Specifies how transform feedback varyings
+     * are written into GPU buffers. Use {@link TRANSFORM_FEEDBACK_INTERLEAVED} to pack all captured
+     * varyings into a single buffer, or {@link TRANSFORM_FEEDBACK_SEPARATE} to store each varying
+     * in its own buffer. This setting is only effective when useTransformFeedback property is enabled.
+     * Defaults to {@link TRANSFORM_FEEDBACK_INTERLEAVED}.
+     * @param {string} [definition.vshader] - Vertex shader source (GLSL code). Optional when
+     * compute shader is specified.
+     * @param {string} [definition.fshader] - Fragment shader source (GLSL code). Optional when
+     * useTransformFeedback or compute shader is specified.
+     * @param {string} [definition.cshader] - Compute shader source (WGSL code). Only supported on
+     * WebGPU platform.
+     * @param {string} [definition.computeEntryPoint] - The entry point function name for the compute
+     * shader. Defaults to 'main'.
+     * @param {BindGroupFormat} [definition.computeBindGroupFormat] - The bind group format for
+     * caller-provided compute resources in group 0. Only used on WebGPU.
+     * @param {Object<string, UniformBufferFormat>} [definition.computeUniformBufferFormats] - The
+     * uniform buffer formats keyed by bind group entry name. Requires computeBindGroupFormat.
+     * @param {Map<string, string>} [definition.vincludes] - A map containing key-value pairs of
+     * include names and their content. These are used for resolving #include directives in the
+     * vertex shader source.
+     * @param {Map<string, string>} [definition.fincludes] - A map containing key-value pairs
+     * of include names and their content. These are used for resolving #include directives in the
+     * fragment shader source.
+     * @param {Map<string, string>} [definition.cincludes] - A map containing key-value pairs
+     * of include names and their content. These are used for resolving #include directives in the
+     * compute shader source.
+     * @param {Map<string, string>} [definition.cdefines] - A map containing key-value pairs of
+     * define names and their values. These are used for resolving defines in the compute shader.
+     * @param {boolean} [definition.useTransformFeedback] - Specifies that this shader outputs
+     * post-VS data to a buffer.
+     * @param {string | string[]} [definition.fragmentOutputTypes] - Fragment shader output types,
+     * which default to vec4. Passing a string will set the output type for all color attachments.
+     * Passing an array will set the output type for each color attachment.
+     * @param {boolean} [definition.useDualSourceBlending] - Whether the fragment shader outputs a
+     * secondary color for dual-source blending. Defaults to false.
+     * @param {string} [definition.shaderLanguage] - Specifies the shader language of vertex and
+     * fragment shaders. Defaults to {@link SHADERLANGUAGE_GLSL}.
+     * @example
+     * // Create a shader that renders primitives with a solid red color
+     *
+     * // Vertex shader
+     * const vshader = `
+     * attribute vec3 aPosition;
+     *
+     * void main(void) {
+     *     gl_Position = vec4(aPosition, 1.0);
+     * }
+     * `;
+     *
+     * // Fragment shader
+     * const fshader = `
+     * precision ${graphicsDevice.precision} float;
+     *
+     * void main(void) {
+     *     gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0);
+     * }
+     * `;
+     *
+     * const shaderDefinition = {
+     *     attributes: {
+     *         aPosition: SEMANTIC_POSITION
+     *     },
+     *     vshader,
+     *     fshader
+     * };
+     *
+     * const shader = new Shader(graphicsDevice, shaderDefinition);
+     */
+    constructor(graphicsDevice, definition) {
+        this.id = id++;
+        this.device = graphicsDevice;
+
+        // shallow copy the definition, as the code below replaces the shader sources with their
+        // pre-processed versions and may add extracted attributes. The object supplied by the
+        // caller must not be modified.
+        definition = { ...definition };
+
+        this.definition = definition;
+        this.name = definition.name || 'Untitled';
+        this.init();
+
+        if (definition.cshader) {
+            Debug.assert(graphicsDevice.supportsCompute, 'Compute shaders are not supported on this device.');
+            Debug.assert(!definition.vshader && !definition.fshader, 'Vertex and fragment shaders are not supported when creating a compute shader.');
+
+            // the definition as supplied, before its source is pre-processed, which variants
+            // compiled with additional defines are created from
+            this.computeDefinition = { ...definition };
+
+            // keep reference to unmodified shader in debug mode
+            Debug.call(() => {
+                this.cUnmodified = definition.cshader;
+            });
+
+            // Prepend enables and defines to compute shader source
+            const enablesCode = ShaderDefinitionUtils.getWGSLEnables(graphicsDevice, 'compute');
+            const definesCode = ShaderDefinitionUtils.getDefinesCode(graphicsDevice, definition.cdefines);
+
+            const cshader = enablesCode + definesCode + definition.cshader;
+
+            // Add the built-in includes for compute shaders (if not already provided by user). Note
+            // this copies the supplied map, which must not be modified.
+            const cincludes = new Map(definition.cincludes);
+            if (!cincludes.has('halfTypesCS')) {
+                cincludes.set('halfTypesCS', halfTypes);
+            }
+            if (!cincludes.has('sceneDepthCS')) {
+                cincludes.set('sceneDepthCS', sceneDepthCS);
+            }
+            if (!cincludes.has('sceneColorCS')) {
+                cincludes.set('sceneColorCS', sceneColorCS);
+            }
+            if (!cincludes.has('dispatchThreadsCS')) {
+                cincludes.set('dispatchThreadsCS', dispatchThreadsCS);
+            }
+
+            // pre-process compute shader source
+            definition.cshader = Preprocessor.run(cshader, cincludes, {
+                sourceName: `compute shader for ${this.label}`,
+                stripDefines: true
+            });
+
+        } else {
+            Debug.assert(definition.vshader, 'No vertex shader has been specified when creating a shader.');
+            Debug.assert(definition.fshader, 'No fragment shader has been specified when creating a shader.');
+
+            // keep reference to unmodified shaders in debug mode
+            Debug.call(() => {
+                this.vUnmodified = definition.vshader;
+                this.fUnmodified = definition.fshader;
+            });
+
+            const wgsl = definition.shaderLanguage === SHADERLANGUAGE_WGSL;
+
+            // pre-process vertex shader source
+            definition.vshader = Preprocessor.run(definition.vshader, definition.vincludes, {
+                sourceName: `vertex shader for ${this.label}`,
+                stripDefines: wgsl
+            });
+
+            // if no attributes are specified, try to extract the default names after the shader has been pre-processed
+            if (definition.shaderLanguage === SHADERLANGUAGE_GLSL) {
+                definition.attributes ??= ShaderDefinitionUtils.collectAttributes(definition.vshader);
+            }
+
+            // Strip unused color attachments from fragment shader.
+            // Note: this is only needed for iOS 15 on WebGL2 where there seems to be a bug where color attachments that are not
+            // written to generate metal linking errors. This is fixed on iOS 16, and iOS 14 does not support WebGL2.
+            const stripUnusedColorAttachments = graphicsDevice.isWebGL2 && (platform.name === 'osx' || platform.name === 'ios');
+
+            // pre-process fragment shader source
+            definition.fshader = Preprocessor.run(definition.fshader, definition.fincludes, {
+                stripUnusedColorAttachments,
+                stripDefines: wgsl,
+                sourceName: `fragment shader for ${this.label}`
+            });
+
+            if (!definition.vshader || !definition.fshader) {
+                Debug.error(`Shader: Failed to create shader ${this.label}. Vertex or fragment shader source is empty.`, this);
+                this.failed = true;
+                return;
+            }
+        }
+
+        this.impl = graphicsDevice.createShaderImpl(this);
+
+        // add it to the device list of all shaders
+        graphicsDevice.shaders.push(this);
+
+        Debug.trace(TRACEID_SHADER_ALLOC, `Alloc: ${this.label}, stack: ${DebugGraphics.toString()}`, {
+            instance: this
+        });
+    }
+
+    /**
+     * Initialize a shader back to its default state.
+     *
+     * @private
+     */
+    init() {
+        this.ready = false;
+        this.failed = false;
+    }
+
+    /** @ignore */
+    get label() {
+        return `Shader Id ${this.id} (${this.definition.shaderLanguage === SHADERLANGUAGE_WGSL ? 'WGSL' : 'GLSL'}) ${this.name}`;
+    }
+
+    // #if _DEBUG
+    /**
+     * Whether the shader reads a uniform, for debug validation. On WebGL the active uniforms of the
+     * linked program, from which the driver strips the unused ones. On WebGPU the uniforms the
+     * shader declares, as WGSL is not reflected. Debug builds only.
+     *
+     * @param {string} name - The name of the uniform.
+     * @returns {boolean|null} Whether the shader reads the uniform, or null when that is not known,
+     * before the shader is ready or on a device without shader reflection.
+     * @ignore
+     */
+    debugReadsUniform(name) {
+        return this.ready ? (this.impl.debugReadsUniform?.(this, name) ?? null) : null;
+    }
+    // #endif
+
+    /**
+     * Frees resources associated with this shader.
+     */
+    destroy() {
+        Debug.trace(TRACEID_SHADER_ALLOC, `DeAlloc: Id ${this.id} ${this.name}`);
+        this.device.onDestroyShader(this);
+
+        // a shader that failed to preprocess has no implementation
+        this.impl?.destroy(this);
+    }
+
+    /**
+     * Called when the WebGL context was lost. It releases all context related resources.
+     *
+     * @ignore
+     */
+    loseContext() {
+        this.init();
+        this.impl.loseContext();
+    }
+
+    /** @ignore */
+    restoreContext() {
+        this.impl.restoreContext(this.device, this);
+    }
+}
+
+export { Shader };

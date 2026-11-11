@@ -1,0 +1,34 @@
+// backend shader implementation code which executes prior to the front end code, and contains code
+// which is required by the frontend code.
+export default /* wgsl */`
+
+#include "basePS"
+#include "sphericalPS"
+#include "decodePS"
+#include "gammaPS"
+#include "tonemappingPS"
+#include "fogPS"
+
+// 9-slice support code
+#if LIT_NONE_SLICE_MODE == SLICED
+    #include "baseNineSlicedPS"
+#elif LIT_NONE_SLICE_MODE == TILED
+    #include "baseNineSlicedTiledPS"
+#endif
+
+// flat shading
+#ifdef FLAT_SHADING
+    #include "flatNormalPS"
+#endif
+
+// TBN
+#ifdef LIT_TBN
+    #include "TBNPS"
+#endif
+
+// two sided lighting
+#ifdef LIT_NEEDS_NORMAL
+    #include "twoSidedLightingPS"
+#endif
+
+`;

@@ -1,0 +1,193 @@
+import {
+    CUBEPROJ_NONE,
+    MASK_AFFECT_DYNAMIC, TONEMAP_NONE, SHADERDEF_INSTANCING, SHADERDEF_MORPH_NORMAL,
+    SHADERDEF_MORPH_POSITION, SHADERDEF_SCREENSPACE, SHADERDEF_SKIN,
+    SHADERDEF_NOSHADOW, SHADERDEF_TANGENTS, SPRITE_RENDERMODE_SIMPLE,
+    SHADERDEF_MORPH_TEXTURE_BASED_INT, SHADERDEF_CLIP,
+    FOG_NONE,
+    REFLECTIONSRC_NONE, REFLECTIONSRC_ENVATLAS, REFLECTIONSRC_ENVATLASHQ, REFLECTIONSRC_CUBEMAP,
+    AMBIENTSRC_AMBIENTSH, AMBIENTSRC_ENVALATLAS, AMBIENTSRC_CONSTANT,
+    SHADER_PREPASS, SCENETEXTURE_DEPTH
+} from '../constants.js';
+import { shaderDefsToLightMask } from '../light-mask.js';
+
+/**
+ * @import { Light } from '../light.js'
+ * @import { LightList } from '../lighting/light-list.js'
+ */
+
+class LitMaterialOptionsBuilder {
+    static update(litOptions, material, scene, renderParams, objDefs, pass, lightList) {
+        LitMaterialOptionsBuilder.updateSharedOptions(litOptions, material, scene, objDefs, pass, renderParams);
+        LitMaterialOptionsBuilder.updateMaterialOptions(litOptions, material);
+        LitMaterialOptionsBuilder.updateEnvOptions(litOptions, material, scene, renderParams);
+        LitMaterialOptionsBuilder.updateLightingOptions(litOptions, material, scene, objDefs, lightList);
+    }
+
+    static updateSharedOptions(litOptions, material, scene, objDefs, pass, renderParams) {
+        litOptions.shaderChunks = material.shaderChunks;
+        litOptions.pass = pass;
+
+        // linear depth is rendered by the prepass, and by the forward pass when the camera renders
+        // the scene depth into a scene texture
+        litOptions.linearDepth = pass === SHADER_PREPASS ||
+            !!renderParams?.sceneTextures.includes(SCENETEXTURE_DEPTH);
+
+        litOptions.alphaTest = material.alphaTest > 0;
+        litOptions.blendType = material.blendType;
+
+        litOptions.screenSpace = objDefs && (objDefs & SHADERDEF_SCREENSPACE) !== 0;
+        litOptions.skin = objDefs && (objDefs & SHADERDEF_SKIN) !== 0;
+        litOptions.useInstancing = objDefs && (objDefs & SHADERDEF_INSTANCING) !== 0;
+        litOptions.useMorphPosition = objDefs && (objDefs & SHADERDEF_MORPH_POSITION) !== 0;
+        litOptions.useMorphNormal = objDefs && (objDefs & SHADERDEF_MORPH_NORMAL) !== 0;
+        litOptions.useMorphTextureBasedInt = objDefs && (objDefs & SHADERDEF_MORPH_TEXTURE_BASED_INT) !== 0;
+        litOptions.hasTangents = objDefs && ((objDefs & SHADERDEF_TANGENTS) !== 0);
+        litOptions.useClipPlanes = objDefs && (objDefs & SHADERDEF_CLIP) !== 0;
+
+        litOptions.nineSlicedMode = material.nineSlicedMode || SPRITE_RENDERMODE_SIMPLE;
+
+        // clustered lighting features (in shared options as shadow pass needs this too)
+        if (material.useLighting && scene.clusteredLightingEnabled) {
+            litOptions.clusteredLightingEnabled = true;
+            litOptions.clusteredLightingCookiesEnabled = scene.lighting.cookiesEnabled;
+            litOptions.clusteredLightingShadowsEnabled = scene.lighting.shadowsEnabled;
+            litOptions.clusteredLightingShadowType = scene.lighting.shadowType;
+            // area light shapes the shaders support, none when area lights are disabled
+            const areaLightShapes = scene.lighting.areaLightShapes;
+            litOptions.clusteredLightingAreaLightsEnabled = areaLightShapes !== 0;
+            litOptions.clusteredLightingAreaLightShapes = areaLightShapes;
+        } else {
+            litOptions.clusteredLightingEnabled = false;
+            litOptions.clusteredLightingCookiesEnabled = false;
+            litOptions.clusteredLightingShadowsEnabled = false;
+            litOptions.clusteredLightingAreaLightsEnabled = false;
+            litOptions.clusteredLightingAreaLightShapes = 0;
+        }
+    }
+
+    static updateMaterialOptions(litOptions, material) {
+        litOptions.separateAmbient = false;    // store ambient light color in separate variable, instead of adding it to diffuse directly
+        litOptions.pixelSnap = material.pixelSnap;
+
+        litOptions.ambientSH = material.ambientSH;
+        litOptions.occludeSpecular = material.occludeSpecular;
+        // the intensity is always applied, so that an intensity of 1 shares the shader of a lower one
+        litOptions.occludeSpecularFloat = true;
+
+        litOptions.useMsdf = false;
+        litOptions.msdfTextAttribute = false;
+
+        litOptions.alphaToCoverage = material.alphaToCoverage;
+        litOptions.opacityFadesSpecular = material.opacityFadesSpecular;
+        litOptions.opacityDither = material.opacityDither;
+
+        litOptions.cubeMapProjection = CUBEPROJ_NONE;
+
+        litOptions.useSpecular = material.hasSpecular;
+        litOptions.useSpecularityFactor = material.hasSpecularityFactor;
+        litOptions.enableGGXSpecular = material.ggxSpecular;
+        litOptions.useAnisotropy = false; // LitMaterial doesn't support anisotropy
+        litOptions.fresnelModel = material.fresnelModel;
+        litOptions.useRefraction = material.hasRefraction;
+        litOptions.useClearCoat = material.hasClearCoat;
+        litOptions.useSheen = material.hasSheen;
+        litOptions.useIridescence = material.hasIridescence;
+        litOptions.useDiffuseTransmission = material.hasDiffuseTransmission;
+        litOptions.useMetalness = material.hasMetalness;
+        litOptions.useDynamicRefraction = material.dynamicRefraction;
+        litOptions.dispersion = material.hasDispersion;
+
+        litOptions.vertexColors = false;
+        litOptions.lightMapEnabled = material.hasLighting;
+        litOptions.dirLightMapEnabled = material.dirLightMap;
+        litOptions.useHeights = material.hasHeights;
+        litOptions.useNormals = material.hasNormals;
+        litOptions.useClearCoatNormals = material.hasClearCoatNormals;
+        litOptions.useAo = material.hasAo;
+    }
+
+    static updateEnvOptions(litOptions, material, scene, renderParams) {
+        litOptions.fog = material.useFog ? renderParams.fog : FOG_NONE;
+        litOptions.gamma = renderParams.shaderOutputGamma;
+        litOptions.toneMap = material.useTonemap ? renderParams.toneMapping : TONEMAP_NONE;
+
+        // source of reflections
+        if (material.useSkybox && scene.envAtlas && scene.skybox) {
+            litOptions.reflectionSource = REFLECTIONSRC_ENVATLASHQ;
+            litOptions.reflectionEncoding = scene.envAtlas.encoding;
+            litOptions.reflectionCubemapEncoding = scene.skybox.encoding;
+        } else if (material.useSkybox && scene.envAtlas) {
+            litOptions.reflectionSource = REFLECTIONSRC_ENVATLAS;
+            litOptions.reflectionEncoding = scene.envAtlas.encoding;
+        } else if (material.useSkybox && scene.skybox) {
+            litOptions.reflectionSource = REFLECTIONSRC_CUBEMAP;
+            litOptions.reflectionEncoding = scene.skybox.encoding;
+        } else {
+            litOptions.reflectionSource = REFLECTIONSRC_NONE;
+            litOptions.reflectionEncoding = null;
+        }
+
+        // source of environment ambient is as follows:
+        if (material.ambientSH) {
+            litOptions.ambientSource = AMBIENTSRC_AMBIENTSH;
+            litOptions.ambientEncoding = null;
+        } else if (litOptions.reflectionSource !== REFLECTIONSRC_NONE && scene.envAtlas) {
+            litOptions.ambientSource = AMBIENTSRC_ENVALATLAS;
+            litOptions.ambientEncoding = scene.envAtlas.encoding;
+        } else {
+            litOptions.ambientSource = AMBIENTSRC_CONSTANT;
+            litOptions.ambientEncoding = null;
+        }
+
+        const hasSkybox = litOptions.reflectionSource !== REFLECTIONSRC_NONE;
+        litOptions.skyboxIntensity = hasSkybox;
+        litOptions.useCubeMapRotation = hasSkybox && scene._skyboxRotationShaderInclude;
+    }
+
+    static updateLightingOptions(litOptions, material, scene, objDefs, lightList) {
+        litOptions.lightMapWithoutAmbient = false;
+
+        if (material.useLighting) {
+            const mask = objDefs ? shaderDefsToLightMask(objDefs) : MASK_AFFECT_DYNAMIC;
+
+            // mask to select lights (dynamic vs lightmapped) when using clustered lighting
+            litOptions.lightMaskDynamic = !!(mask & MASK_AFFECT_DYNAMIC);
+            litOptions.lightMapWithoutAmbient = false;
+
+            litOptions.lights = LitMaterialOptionsBuilder.selectLights(lightList, mask);
+        } else {
+            litOptions.lights = [];
+        }
+
+        if ((litOptions.lights.length === 0 && !scene.clusteredLightingEnabled) || ((objDefs & SHADERDEF_NOSHADOW) !== 0)) {
+            litOptions.noShadow = true;
+        }
+    }
+
+    /**
+     * Returns the lights a mask selects, each at its light slot. A slot is the light's index in
+     * {@link LightList#slots}, the same for every mesh instance in the pass, so the slots this
+     * mask does not select are left as holes and the shader compiles them out. The renderer
+     * dispatches the lights from the same list, so the two cannot disagree.
+     *
+     * @param {LightList|undefined} lightList - The lights of the pass.
+     * @param {number} mask - The light mask of the mesh instance being drawn.
+     * @returns {Light[]} The selected lights, indexed by light slot.
+     */
+    static selectLights(lightList, mask) {
+        const selected = [];
+        if (lightList) {
+            const slots = lightList.slots;
+            for (let i = 0; i < slots.length; i++) {
+                const light = slots[i];
+                if (light.mask & mask) {
+                    selected[i] = light;
+                }
+            }
+        }
+        return selected;
+    }
+}
+
+export { LitMaterialOptionsBuilder };

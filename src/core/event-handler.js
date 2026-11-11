@@ -1,0 +1,347 @@
+import { EventHandle } from './event-handle.js';
+
+/**
+ * @callback HandleEventCallback
+ * Callback used by {@link EventHandler} functions. Note the callback is limited to 8 arguments.
+ * @param {any} [arg1] - First argument that is passed from caller.
+ * @param {any} [arg2] - Second argument that is passed from caller.
+ * @param {any} [arg3] - Third argument that is passed from caller.
+ * @param {any} [arg4] - Fourth argument that is passed from caller.
+ * @param {any} [arg5] - Fifth argument that is passed from caller.
+ * @param {any} [arg6] - Sixth argument that is passed from caller.
+ * @param {any} [arg7] - Seventh argument that is passed from caller.
+ * @param {any} [arg8] - Eighth argument that is passed from caller.
+ * @returns {void}
+ */
+
+/**
+ * Abstract base class that implements functionality for event handling.
+ *
+ * ```javascript
+ * const obj = new EventHandlerSubclass();
+ *
+ * // subscribe to an event
+ * obj.on('hello', (str) => {
+ *     console.log('event hello is fired', str);
+ * });
+ *
+ * // fire event
+ * obj.fire('hello', 'world');
+ * ```
+ *
+ * @category Framework
+ */
+class EventHandler {
+    /**
+     * @type {Map<string,Array<EventHandle>>}
+     * @private
+     */
+    _callbacks = new Map();
+
+    /**
+     * @type {Map<string,Array<EventHandle>>}
+     * @private
+     */
+    _callbackActive = new Map();
+
+    /**
+     * Reinitialize the event handler.
+     * @ignore
+     */
+    initEventHandler() {
+        this._callbacks = new Map();
+        this._callbackActive = new Map();
+    }
+
+    /**
+     * Registers a new event handler.
+     *
+     * @param {string} name - Name of the event to bind the callback to.
+     * @param {HandleEventCallback} callback - Function that is called when event is fired. Note
+     * the callback is limited to 8 arguments.
+     * @param {object} scope - Object to use as 'this' when the event is fired, defaults to
+     * current this.
+     * @param {boolean} once - If true, the callback will be unbound after being fired once.
+     * @returns {EventHandle} Created {@link EventHandle}.
+     * @ignore
+     */
+    _addCallback(name, callback, scope, once) {
+        // #if _DEBUG
+        if (!name || typeof name !== 'string' || !callback) {
+            console.warn(`EventHandler: subscribing to an event (${name}) with missing arguments`, callback);
+        }
+        // #endif
+
+        if (!this._callbacks.has(name)) {
+            this._callbacks.set(name, []);
+        }
+
+        // if we are adding a callback to the list that is executing right now
+        // ensure we preserve initial list before modifications
+        if (this._callbackActive.has(name)) {
+            const callbackActive = this._callbackActive.get(name);
+            if (callbackActive && callbackActive === this._callbacks.get(name)) {
+                this._callbackActive.set(name, callbackActive.slice());
+            }
+        }
+
+        const evt = new EventHandle(this, name, callback, scope, once);
+        this._callbacks.get(name).push(evt);
+        return evt;
+    }
+
+    /**
+     * Attach an event handler to an event.
+     *
+     * @param {string} name - Name of the event to bind the callback to.
+     * @param {HandleEventCallback} callback - Function that is called when event is fired. Note
+     * the callback is limited to 8 arguments.
+     * @param {object} [scope] - Object to use as 'this' when the event is fired, defaults to
+     * current this.
+     * @returns {EventHandle} An event handle. For later removal, prefer retaining this handle and
+     * calling its {@link EventHandle#off} over {@link EventHandler#off} with a name/callback: it
+     * removes exactly this subscription and is faster (no scan of the callback list).
+     * @example
+     * obj.on('test', (a, b) => {
+     *     console.log(a + b);
+     * });
+     * obj.fire('test', 1, 2); // prints 3 to the console
+     * @example
+     * // preferred removal: retain the handle and call off() on it
+     * const evt = obj.on('test', (a, b) => {
+     *     console.log(a + b);
+     * });
+     * // some time later
+     * evt.off();
+     */
+    on(name, callback, scope = this) {
+        return this._addCallback(name, callback, scope, false);
+    }
+
+    /**
+     * Attach an event handler to an event. The handler is removed before it is called, so it runs
+     * at most once, even if it fires the same event again or throws.
+     *
+     * @param {string} name - Name of the event to bind the callback to.
+     * @param {HandleEventCallback} callback - Function that is called when event is fired. Note
+     * the callback is limited to 8 arguments.
+     * @param {object} [scope] - Object to use as 'this' when the event is fired, defaults to
+     * current this.
+     * @returns {EventHandle} An event handle. For removal before it fires, prefer retaining this
+     * handle and calling its {@link EventHandle#off} over {@link EventHandler#off} with a
+     * name/callback: it removes exactly this subscription and is faster (no scan of the callback
+     * list).
+     * @example
+     * obj.once('test', (a, b) => {
+     *     console.log(a + b);
+     * });
+     * obj.fire('test', 1, 2); // prints 3 to the console
+     * obj.fire('test', 1, 2); // not going to get handled
+     */
+    once(name, callback, scope = this) {
+        return this._addCallback(name, callback, scope, true);
+    }
+
+    /**
+     * Detach an event handler from an event. If callback is not provided then all callbacks are
+     * unbound from the event, if scope is not provided then all events with the callback will be
+     * unbound.
+     *
+     * Use this form to remove all listeners matching a name (and optionally callback/scope). To
+     * remove a single known subscription, prefer retaining the {@link EventHandle} returned by
+     * {@link EventHandler#on} / {@link EventHandler#once} and calling its {@link EventHandle#off}:
+     * it removes exactly that subscription and is faster (no scan of the callback list).
+     *
+     * @param {string} [name] - Name of the event to unbind.
+     * @param {HandleEventCallback} [callback] - Function to be unbound.
+     * @param {object} [scope] - Scope that was used as the this when the event is fired.
+     * @returns {EventHandler} Self for chaining.
+     * @example
+     * const handler = () => {};
+     * obj.on('test', handler);
+     *
+     * obj.off(); // Removes all events
+     * obj.off('test'); // Removes all events called 'test'
+     * obj.off('test', handler); // Removes all handler functions, called 'test'
+     * obj.off('test', handler, this); // Removes all handler functions, called 'test' with scope this
+     */
+    off(name, callback, scope) {
+        if (name) {
+            // if we are removing a callback from the list that is executing right now
+            // ensure we preserve initial list before modifications
+            if (this._callbackActive.has(name) && this._callbackActive.get(name) === this._callbacks.get(name)) {
+                this._callbackActive.set(name, this._callbackActive.get(name).slice());
+            }
+        } else {
+            // if we are removing a callback from any list that is executing right now
+            // ensure we preserve these initial lists before modifications
+            for (const [key, callbacks] of this._callbackActive) {
+                if (!this._callbacks.has(key)) {
+                    continue;
+                }
+
+                if (this._callbacks.get(key) !== callbacks) {
+                    continue;
+                }
+
+                this._callbackActive.set(key, callbacks.slice());
+            }
+        }
+
+        if (!name) {
+            // remove all events
+            for (const callbacks of this._callbacks.values()) {
+                for (let i = 0; i < callbacks.length; i++) {
+                    callbacks[i].removed = true;
+                }
+            }
+            this._callbacks.clear();
+        } else if (!callback) {
+            // remove all events of a specific name
+            const callbacks = this._callbacks.get(name);
+            if (callbacks) {
+                for (let i = 0; i < callbacks.length; i++) {
+                    callbacks[i].removed = true;
+                }
+                this._callbacks.delete(name);
+            }
+        } else {
+            const callbacks = this._callbacks.get(name);
+            if (!callbacks) {
+                return this;
+            }
+
+            for (let i = 0; i < callbacks.length; i++) {
+                // remove all events with a specific name and a callback
+                if (callbacks[i].callback !== callback) {
+                    continue;
+                }
+
+                // could be a specific scope as well
+                if (scope && callbacks[i].scope !== scope) {
+                    continue;
+                }
+
+                callbacks[i].removed = true;
+                callbacks.splice(i, 1);
+                i--;
+            }
+
+            if (callbacks.length === 0) {
+                this._callbacks.delete(name);
+            }
+        }
+
+        return this;
+    }
+
+    /**
+     * Detach an event handler from an event using EventHandle instance. More optimal remove
+     * as it does not have to scan callbacks array.
+     *
+     * @param {EventHandle} handle - Handle of event.
+     * @ignore
+     */
+    offByHandle(handle) {
+        const name = handle.name;
+        handle.removed = true;
+
+        // if we are removing a callback from the list that is executing right now
+        // ensure we preserve initial list before modifications
+        if (this._callbackActive.has(name) && this._callbackActive.get(name) === this._callbacks.get(name)) {
+            this._callbackActive.set(name, this._callbackActive.get(name).slice());
+        }
+
+        const callbacks = this._callbacks.get(name);
+        if (!callbacks) {
+            return this;
+        }
+
+        const ind = callbacks.indexOf(handle);
+        if (ind !== -1) {
+            callbacks.splice(ind, 1);
+
+            if (callbacks.length === 0) {
+                this._callbacks.delete(name);
+            }
+        }
+
+        return this;
+    }
+
+    /**
+     * Fire an event, all additional arguments are passed on to the event listener.
+     *
+     * @param {string} name - Name of event to fire.
+     * @param {any} [arg1] - First argument that is passed to the event handler.
+     * @param {any} [arg2] - Second argument that is passed to the event handler.
+     * @param {any} [arg3] - Third argument that is passed to the event handler.
+     * @param {any} [arg4] - Fourth argument that is passed to the event handler.
+     * @param {any} [arg5] - Fifth argument that is passed to the event handler.
+     * @param {any} [arg6] - Sixth argument that is passed to the event handler.
+     * @param {any} [arg7] - Seventh argument that is passed to the event handler.
+     * @param {any} [arg8] - Eighth argument that is passed to the event handler.
+     * @returns {EventHandler} Self for chaining.
+     * @example
+     * obj.fire('test', 'This is the message');
+     */
+    fire(name, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
+        if (!name) {
+            return this;
+        }
+
+        const callbacksInitial = this._callbacks.get(name);
+        if (!callbacksInitial) {
+            return this;
+        }
+
+        let callbacks;
+
+        if (!this._callbackActive.has(name)) {
+            // when starting callbacks execution ensure we store a list of initial callbacks
+            this._callbackActive.set(name, callbacksInitial);
+        } else {
+            // A nested fire needs its own list so it cannot clear the outer execution's active list.
+            callbacks = callbacksInitial.slice();
+        }
+
+        try {
+            // eslint-disable-next-line no-unmodified-loop-condition
+            for (let i = 0; (callbacks || this._callbackActive.get(name)) && (i < (callbacks || this._callbackActive.get(name)).length); i++) {
+                const evt = (callbacks || this._callbackActive.get(name))[i];
+                if (!evt.callback || evt._onceFired) continue;
+
+                if (evt._once) {
+                    // Consume before calling: the callback can fire this event again or throw.
+                    // Keep this separate from removed, since active lists retain unsubscribed listeners.
+                    evt._onceFired = true;
+                    this.offByHandle(evt);
+                }
+
+                evt.callback.call(evt.scope, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+            }
+        } finally {
+            if (!callbacks) {
+                this._callbackActive.delete(name);
+            }
+        }
+
+        return this;
+    }
+
+    /**
+     * Test if there are any handlers bound to an event name.
+     *
+     * @param {string} name - The name of the event to test.
+     * @returns {boolean} True if the object has handlers bound to the specified event name.
+     * @example
+     * obj.on('test', () => {}); // bind an event to 'test'
+     * obj.hasEvent('test'); // returns true
+     * obj.hasEvent('hello'); // returns false
+     */
+    hasEvent(name) {
+        return !!this._callbacks.get(name)?.length;
+    }
+}
+
+export { EventHandler };

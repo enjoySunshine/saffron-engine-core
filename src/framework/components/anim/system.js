@@ -1,0 +1,197 @@
+import { AnimTrack } from '../../anim/evaluator/anim-track.js';
+import { ComponentSystem } from '../system.js';
+import { AnimComponent } from './component.js';
+
+/**
+ * @import { AppBase } from '../../app-base.js'
+ * @import { Component } from '../component.js'
+ * @import { Entity } from '../../entity.js'
+ */
+
+/**
+ * Options of the `anim` component accepted by {@link AnimComponentSystem} that differ from the
+ * properties of {@link AnimComponent}. Each replaces the same-named property of the options that
+ * {@link Entity#addComponent} derives from the component class; see
+ * {@link ComponentOptionsOverrides}.
+ *
+ * @typedef {object} AnimComponentOptionsOverrides
+ * @property {{ name: string, weight?: number, mask?: object, blendType?: string }[]} [layers] -
+ * Layers to add with {@link AnimComponent#addLayer}, each with a `name` and optional `weight`,
+ * `mask` and `blendType`.
+ * @property {{ [layer: string]: { mask: object } }} [masks] - Bone masks to assign to the added
+ * layers, keyed by layer name.
+ * @ignore
+ */
+
+/**
+ * Manages the {@link AnimComponent}s of an application and advances their state graphs each
+ * frame. Reach it through `app.systems.anim`; components are created with
+ * {@link Entity#addComponent}, never by calling the system directly.
+ *
+ * @category Animation
+ */
+class AnimComponentSystem extends ComponentSystem {
+    /**
+     * Create an AnimComponentSystem instance.
+     *
+     * @param {AppBase} app - The application managing this system.
+     * @ignore
+     */
+    constructor(app) {
+        super(app);
+
+        this.id = 'anim';
+
+        this.ComponentType = AnimComponent;
+
+        // 'layers' is read-only (managed via addLayer) and 'masks' is not a component property; both
+        // are consumed directly in initializeComponentData
+        this.extraDataProperties = ['layers', 'masks'];
+
+        this.on('beforeremove', this.onBeforeRemove, this);
+        this.app.systems.on('animationUpdate', this.onAnimationUpdate, this);
+        this.app.systems.on('meshInstancesChange', this.onMeshInstancesChange, this);
+    }
+
+    initializeComponentData(component, data, properties) {
+        super.initializeComponentData(component, data);
+        const complexProperties = ['animationAssets', 'stateGraph', 'layers', 'masks'];
+        Object.keys(data).forEach((key) => {
+            // these properties will be initialized manually below
+            if (complexProperties.includes(key)) return;
+            component[key] = data[key];
+        });
+        if (data.stateGraph) {
+            component.stateGraph = data.stateGraph;
+            component.loadStateGraph(component.stateGraph);
+        }
+        if (data.layers) {
+            data.layers.forEach((layer) => {
+                // Layers added dynamically via addLayer() aren't part of the state graph, so
+                // loadStateGraph() above won't have recreated them. Resolve (or create) the
+                // matching clone layer by name before assigning its animations.
+                const cloneLayer = component.addLayer(layer.name, layer.weight, layer.mask, layer.blendType);
+                layer._controller.states.forEach((stateKey) => {
+                    layer._controller._states[stateKey]._animationList.forEach((node) => {
+                        if (!node.animTrack || node.animTrack === AnimTrack.EMPTY) {
+                            const animationAsset = this.app.assets.get(layer._component._animationAssets[`${layer.name}:${node.name}`].asset);
+                            // If there is an animation asset that hasn't been loaded, assign it once it has loaded. If it is already loaded it will be assigned already.
+                            if (animationAsset && !animationAsset.loaded) {
+                                animationAsset.once('load', () => {
+                                    cloneLayer.assignAnimation(node.name, animationAsset.resource);
+                                });
+                            }
+                        } else {
+                            cloneLayer.assignAnimation(node.name, node.animTrack);
+                        }
+                    });
+                });
+            });
+        }
+        if (data.animationAssets) {
+            component.animationAssets = Object.assign(component.animationAssets, data.animationAssets);
+        }
+
+        if (data.masks) {
+            Object.keys(data.masks).forEach((key) => {
+                if (component.layers[key]) {
+                    const maskData = data.masks[key].mask;
+                    const mask = {};
+                    Object.keys(maskData).forEach((maskKey) => {
+                        mask[decodeURI(maskKey)] = maskData[maskKey];
+                    });
+                    component.layers[key].mask = mask;
+                }
+            });
+        }
+    }
+
+    onAnimationUpdate(dt) {
+        const components = this.store;
+
+        for (const id in components) {
+            if (components.hasOwnProperty(id)) {
+                const component = components[id].entity.anim;
+
+                if (component.enabled && component.entity.enabled && component.playing) {
+                    component.update(dt);
+                }
+            }
+        }
+    }
+
+    /**
+     * Rebinds every component animating a hierarchy which contains the entity whose mesh instances
+     * changed. Anim targets which reference mesh instances - morph target weights and animated
+     * material textures - are resolved once and then cached, so they have to be re-resolved when the
+     * mesh instances they point at are created or destroyed. Disabled components are included, as
+     * they keep their bindings and are not rebound when re-enabled.
+     *
+     * @param {Component} component - The component whose mesh instances changed.
+     * @private
+     */
+    onMeshInstancesChange(component) {
+        const components = this.store;
+
+        for (const id in components) {
+            if (components.hasOwnProperty(id)) {
+                const animComponent = components[id].entity.anim;
+
+                if (animComponent.animatesEntity(component.entity)) {
+                    animComponent.rebind();
+                }
+            }
+        }
+    }
+
+    cloneComponent(entity, clone) {
+        let masks;
+        // If the component animates from the components entity, any layer mask hierarchy should be
+        // updated from the old entity to the cloned entity.
+        if (!entity.anim.rootBone || entity.anim.rootBone === entity) {
+            masks = {};
+            entity.anim.layers.forEach((layer, i) => {
+                if (layer.mask) {
+                    const mask = {};
+                    Object.keys(layer.mask).forEach((path) => {
+                        // The base of all mask paths should be mapped from the previous entity to the cloned entity
+                        const pathArr = path.split('/');
+                        pathArr.shift();
+                        const clonePath = [clone.name, ...pathArr].join('/');
+                        mask[clonePath] = layer.mask[path];
+                    });
+                    masks[i] = { mask };
+                }
+            });
+        }
+        const data = {
+            enabled: entity.anim.enabled,
+            stateGraphAsset: entity.anim.stateGraphAsset,
+            animationAssets: entity.anim.animationAssets,
+            speed: entity.anim.speed,
+            activate: entity.anim.activate,
+            playing: entity.anim.playing,
+            rootBone: entity.anim.rootBone,
+            stateGraph: entity.anim.stateGraph,
+            layers: entity.anim.layers,
+            layerIndices: entity.anim.layerIndices,
+            parameters: entity.anim.parameters,
+            normalizeWeights: entity.anim.normalizeWeights,
+            masks
+        };
+        return this.addComponent(clone, data);
+    }
+
+    onBeforeRemove(entity, component) {
+        component.onBeforeRemove();
+    }
+
+    destroy() {
+        super.destroy();
+
+        this.app.systems.off('animationUpdate', this.onAnimationUpdate, this);
+        this.app.systems.off('meshInstancesChange', this.onMeshInstancesChange, this);
+    }
+}
+
+export { AnimComponentSystem };

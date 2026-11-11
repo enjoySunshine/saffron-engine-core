@@ -1,0 +1,2160 @@
+import { version, revision } from '../core/core.js';
+import { now } from '../core/time.js';
+import { path } from '../core/path.js';
+import { TRACEID_RENDER_FRAME, TRACEID_RENDER_FRAME_TIME } from '../core/constants.js';
+import { Debug } from '../core/debug.js';
+import { EventHandler } from '../core/event-handler.js';
+import { math } from '../core/math/math.js';
+
+import {
+    SHADERLANGUAGE_GLSL,
+    SHADERLANGUAGE_WGSL
+} from '../platform/graphics/constants.js';
+import { DebugGraphics } from '../platform/graphics/debug-graphics.js';
+import { http } from '../platform/net/http.js';
+
+import {
+    LAYERID_DEPTH, LAYERID_IMMEDIATE, LAYERID_SKYBOX, LAYERID_UI, LAYERID_WORLD,
+    SORTMODE_NONE, SORTMODE_MANUAL
+} from '../scene/constants.js';
+import { setProgramLibrary } from '../scene/shader-lib/get-program-library.js';
+import { ProgramLibrary } from '../scene/shader-lib/program-library.js';
+import { ForwardRenderer } from '../scene/renderer/forward-renderer.js';
+import { FrameGraph } from '../scene/frame-graph.js';
+import { AreaLightLuts } from '../scene/area-light-luts.js';
+import { Layer } from '../scene/layer.js';
+import { LayerComposition } from '../scene/composition/layer-composition.js';
+import { Scene } from '../scene/scene.js';
+import { StandardMaterial } from '../scene/materials/standard-material.js';
+import { setDefaultMaterial } from '../scene/materials/default-material.js';
+
+import {
+    FILLMODE_FILL_WINDOW, FILLMODE_KEEP_ASPECT,
+    RESOLUTION_AUTO, RESOLUTION_FIXED
+} from './constants.js';
+import { Asset } from './asset/asset.js';
+import { AssetRegistry } from './asset/asset-registry.js';
+import { BundleRegistry } from './bundle/bundle-registry.js';
+import { ComponentSystemRegistry } from './components/registry.js';
+import { BundleHandler } from './handlers/bundle.js';
+import { ResourceLoader } from './handlers/loader.js';
+import { I18n } from './i18n/i18n.js';
+import { ScriptRegistry } from './script/script-registry.js';
+import { Entity } from './entity.js';
+import { SceneRegistry } from './scene-registry.js';
+import { script } from './script.js';
+import { AppStats } from './app-stats.js';
+import { getApplication, setApplication } from './globals.js';
+import { shaderChunksGLSL } from '../scene/shader-lib/glsl/collections/shader-chunks-glsl.js';
+import { shaderChunksWGSL } from '../scene/shader-lib/wgsl/collections/shader-chunks-wgsl.js';
+import { ShaderChunks } from '../scene/shader-lib/shader-chunks.js';
+
+/**
+ * @import { AppOptions } from './app-options.js'
+ * @import { BatchManager } from '../scene/batching/batch-manager.js'
+ * @import { Color } from '../core/math/color.js'
+ * @import { ElementInput } from './input/element-input.js'
+ * @import { GamePads } from '../platform/input/game-pads.js'
+ * @import { GraphicsDevice } from '../platform/graphics/graphics-device.js'
+ * @import { Keyboard } from '../platform/input/keyboard.js'
+ * @import { Lightmapper } from './lightmapper/lightmapper.js'
+ * @import { Mouse } from '../platform/input/mouse.js'
+ * @import { SoundManager } from '../platform/sound/manager.js'
+ * @import { TouchDevice } from '../platform/input/touch-device.js'
+ * @import { Vec3 } from '../core/math/vec3.js'
+ * @import { XrManager } from './xr/xr-manager.js'
+ */
+
+/**
+ * @callback ConfigureAppCallback
+ * Callback used by {@link AppBase#configure} when configuration file is loaded and parsed (or an
+ * error occurs).
+ * @param {string|null} err - The error message in the case where the loading or parsing fails.
+ * @returns {void}
+ */
+
+/**
+ * @callback PreloadAppCallback
+ * Callback used by {@link AppBase#preload} when all assets (marked as 'preload') are loaded.
+ * @returns {void}
+ */
+
+/**
+ * Gets the current application, if any.
+ *
+ * @type {AppBase|null}
+ * @ignore
+ */
+let app = null;
+
+/**
+ * The version of the contract under which an app announces itself to a devtools hook, defined on
+ * the global object under `Symbol.for('playcanvas.inspector')`. The hook's `register(app, info)` is
+ * called once an app is initialized, with its graphics device, scene, root entity and component
+ * systems in place, and `unregister(app)` as it is destroyed. An app created with
+ * {@link AppOptions#devtools} set to false does neither. The symbol is looked up at those two
+ * points only, not when the module loads, so the module stays free of side effects.
+ *
+ * @type {number}
+ * @ignore
+ */
+const DEVTOOLS_PROTOCOL = 1;
+
+/**
+ * AppBase represents the base functionality for all PlayCanvas applications. It is responsible for
+ * initializing and managing the application lifecycle. It coordinates core engine systems such
+ * as:
+ *
+ * - The graphics device - see {@link GraphicsDevice}.
+ * - The asset registry - see {@link AssetRegistry}.
+ * - The component system registry - see {@link ComponentSystemRegistry}.
+ * - The scene - see {@link Scene}.
+ * - Input devices - see {@link Keyboard}, {@link Mouse}, {@link TouchDevice}, and {@link GamePads}.
+ * - The main update/render loop.
+ *
+ * Using AppBase directly requires you to register {@link ComponentSystem}s and
+ * {@link ResourceHandler}s yourself. This facilitates
+ * [tree-shaking](https://developer.mozilla.org/en-US/docs/Glossary/Tree_shaking) when bundling
+ * your application.
+ *
+ * It is the preferred entry point for new code - {@link Application} is a convenience subclass
+ * that registers everything for you, and is expected to be deprecated in a future release.
+ *
+ * `new AppBase(canvas)` only constructs the instance and its root entity. You must then call
+ * {@link AppBase#init} with an {@link AppOptions} supplying at minimum `graphicsDevice`,
+ * `componentSystems` and `resourceHandlers` before adding components or calling
+ * {@link AppBase#start}. Create the `graphicsDevice` with {@link createGraphicsDevice}.
+ *
+ * @category Framework
+ */
+class AppBase extends EventHandler {
+    /**
+     * The application's batch manager.
+     *
+     * @type {BatchManager|null}
+     * @private
+     */
+    _batcher = null;
+
+    /** @private */
+    _destroyRequested = false;
+
+    /** @private */
+    _inFrameUpdate = false;
+
+    /**
+     * Whether the app announced itself to a devtools hook, and so withdraws on destroy.
+     *
+     * @private
+     */
+    _devtoolsRegistered = false;
+
+    /** @private */
+    _librariesLoaded = false;
+
+    /** @private */
+    _fillMode = FILLMODE_KEEP_ASPECT;
+
+    /** @private */
+    _resolutionMode = RESOLUTION_FIXED;
+
+    /** @private */
+    _allowResize = true;
+
+    /**
+     * @type {Asset|null}
+     * @private
+     */
+    _skyboxAsset = null;
+
+    /**
+     * @type {SoundManager}
+     * @private
+     */
+    _soundManager;
+
+    /** @private */
+    _visibilityChangeHandler;
+
+    /**
+     * Stores all entities that have been created for this app by guid.
+     *
+     * @type {Object<string, Entity>}
+     * @ignore
+     */
+    _entityIndex = {};
+
+    /** @ignore */
+    _inTools = false;
+
+    /** @ignore */
+    _scriptPrefix = '';
+
+    /** @ignore */
+    _time = 0;
+
+    /**
+     * Set this to false if you want to run without using bundles. We set it to true only if
+     * TextDecoder is available because we currently rely on it for untarring.
+     *
+     * @ignore
+     */
+    enableBundles = (typeof TextDecoder !== 'undefined');
+
+    /**
+     * A request id returned by requestAnimationFrame, allowing us to cancel it.
+     *
+     * @ignore
+     */
+    frameRequestId;
+
+    /**
+     * Main loop tick, invoked by `requestAnimationFrame` each frame. Bound to this instance so
+     * it can be passed directly to `requestAnimationFrame`. Subclasses may replace this with
+     * their own tick function.
+     *
+     * @param {number} [timestamp] - The timestamp supplied by requestAnimationFrame.
+     * @param {XRFrame} [xrFrame] - XRFrame from requestAnimationFrame callback.
+     * @ignore
+     */
+    tick = (timestamp, xrFrame) => {
+        if (!this.graphicsDevice) {
+            return;
+        }
+
+        // cancel any hanging rAF to avoid multiple rAF callbacks per frame
+        if (this.frameRequestId) {
+            this.xr?.session?.cancelAnimationFrame(this.frameRequestId);
+            cancelAnimationFrame(this.frameRequestId);
+            this.frameRequestId = null;
+        }
+
+        setApplication(this);
+
+        // have current application pointer in pc
+        app = this;
+
+        const currentTime = this._processTimestamp(timestamp) || now();
+        const ms = currentTime - (this._time || currentTime);
+        let dt = ms / 1000.0;
+        dt = math.clamp(dt, 0, this.maxDeltaTime);
+        dt *= this.timeScale;
+
+        this._time = currentTime;
+
+        // Submit a request to queue up a new animation frame immediately
+        this.requestAnimationFrame();
+
+        if (this.graphicsDevice.contextLost) {
+            return;
+        }
+
+        // set after the context lost check, which returns before the end of the frame where a
+        // deferred destroy runs. While the context is lost no frame work runs, so destroy() acts
+        // at once instead of waiting for a restore that may never come.
+        this._inFrameUpdate = true;
+
+        this.stats.updateBasic(currentTime, dt, ms, this.renderer, this.graphicsDevice);
+
+        // #if _PROFILER
+        this.stats.updateDetailed(this.renderer, this.graphicsDevice);
+        // #endif
+
+        this.fire('frameupdate', ms);
+
+        let skipUpdate = false;
+
+        if (xrFrame) {
+            skipUpdate = !this.xr?.update(xrFrame);
+        }
+
+        if (!skipUpdate) {
+
+            Debug.trace(TRACEID_RENDER_FRAME, `---- Frame ${this.frame}`);
+            Debug.trace(TRACEID_RENDER_FRAME_TIME, `-- UpdateStart ${now().toFixed(2)}ms`);
+
+            this.update(dt);
+
+            this.fire('framerender');
+
+            if (this.autoRender || this.renderNextFrame) {
+
+                Debug.trace(TRACEID_RENDER_FRAME_TIME, `-- RenderStart ${now().toFixed(2)}ms`);
+
+                this.render();
+                this.renderNextFrame = false;
+
+                Debug.trace(TRACEID_RENDER_FRAME_TIME, `-- RenderEnd ${now().toFixed(2)}ms`);
+            }
+
+            this.fire('frameend');
+            this.stats.frameEnd();
+        }
+
+        this._inFrameUpdate = false;
+
+        if (this._destroyRequested) {
+            this.destroy();
+        }
+    };
+
+    /**
+     * Scales the global time delta. Defaults to 1. Scripts, animation and physics all receive
+     * the scaled delta, so 0 freezes everything that advances with time. It does not pause
+     * scripts: their update and postUpdate methods are still called every frame with a dt of 0,
+     * so input handling, spawning, impulses and any other logic that is not multiplied by dt
+     * carry on. Give gameplay code its own pause check. To pause or slow down physics alone while
+     * the rest of the application keeps running, use {@link RigidBodyComponentSystem#timeScale}.
+     *
+     * @example
+     * // Set the app to run at half speed
+     * this.app.timeScale = 0.5;
+     */
+    timeScale = 1;
+
+    /**
+     * Clamps per-frame delta time to an upper bound. Useful since returning from a tab
+     * deactivation can generate huge values for dt, which can adversely affect game state.
+     * Defaults to 0.1 (seconds).
+     *
+     * @type {number}
+     * @example
+     * // Don't clamp inter-frame times of 200ms or less
+     * this.app.maxDeltaTime = 0.2;
+     */
+    maxDeltaTime = 0.1; // Maximum delta is 0.1s or 10 fps.
+
+    /**
+     * The total number of frames the application has updated since start() was called.
+     *
+     * @ignore
+     */
+    frame = 0;
+
+    /**
+     * The frame graph.
+     *
+     * @type {FrameGraph}
+     * @ignore
+     */
+    frameGraph = new FrameGraph();
+
+    /**
+     * The forward renderer.
+     *
+     * @type {ForwardRenderer}
+     * @ignore
+     */
+    renderer;
+
+    /**
+     * Scripts in order of loading first.
+     *
+     * @type {string[]}
+     */
+    scriptsOrder = [];
+
+    /**
+     * @type {AppStats}
+     * @private
+     */
+    _stats;
+
+    /**
+     * When true, the application's render function is called every frame. Setting autoRender to
+     * false is useful to applications where the rendered image may often be unchanged over time.
+     * This can heavily reduce the application's load on the CPU and GPU. Defaults to true.
+     *
+     * @example
+     * // Disable rendering every frame and only render on a keydown event
+     * this.app.autoRender = false;
+     * this.app.keyboard.on('keydown', (event) => {
+     *     this.app.renderNextFrame = true;
+     * });
+     */
+    autoRender = true;
+
+    /**
+     * Set to true to render the scene on the next iteration of the main loop. This only has an
+     * effect if {@link autoRender} is set to false. The value of renderNextFrame is set back to
+     * false again as soon as the scene has been rendered.
+     *
+     * @example
+     * // Render the scene only while space key is pressed
+     * if (this.app.keyboard.isPressed(KEY_SPACE)) {
+     *     this.app.renderNextFrame = true;
+     * }
+     */
+    renderNextFrame = false;
+
+    /**
+     * The graphics device used by the application.
+     *
+     * @type {GraphicsDevice}
+     */
+    graphicsDevice;
+
+    /**
+     * The root entity of the application.
+     *
+     * @type {Entity}
+     * @example
+     * // Return the first entity called 'Camera' in a depth-first search of the scene hierarchy
+     * const camera = this.app.root.findByName('Camera');
+     */
+    root;
+
+    /**
+     * The scene managed by the application.
+     *
+     * @type {Scene}
+     * @example
+     * // Set the fog type property of the application's scene
+     * this.app.scene.fog.type = FOG_LINEAR;
+     */
+    scene;
+
+    /**
+     * The run-time lightmapper.
+     *
+     * @type {Lightmapper|null}
+     */
+    lightmapper = null;
+
+    /**
+     * The resource loader.
+     *
+     * @type {ResourceLoader}
+     */
+    loader = new ResourceLoader(this);
+
+    /**
+     * The asset registry managed by the application.
+     *
+     * @type {AssetRegistry}
+     * @example
+     * // Search the asset registry for all assets with the tag 'vehicle'
+     * const vehicleAssets = this.app.assets.findByTag('vehicle');
+     */
+    assets = new AssetRegistry(this.loader);
+
+    /**
+     * The bundle registry managed by the application.
+     *
+     * @type {BundleRegistry}
+     * @ignore
+     */
+    bundles;
+
+    /**
+     * The scene registry managed by the application.
+     *
+     * @type {SceneRegistry}
+     * @example
+     * // Search the scene registry for a item with the name 'racetrack1'
+     * const sceneItem = this.app.scenes.find('racetrack1');
+     *
+     * // Load the scene using the item's url
+     * this.app.scenes.loadScene(sceneItem.url);
+     */
+    scenes = new SceneRegistry(this);
+
+    /**
+     * The application's script registry.
+     *
+     * @type {ScriptRegistry}
+     */
+    scripts = new ScriptRegistry(this);
+
+    /**
+     * The application's component system registry.
+     *
+     * @type {ComponentSystemRegistry}
+     * @example
+     * // Set global gravity to zero
+     * this.app.systems.rigidbody.gravity.set(0, 0, 0);
+     * @example
+     * // Set the global sound volume to 50%
+     * this.app.systems.sound.volume = 0.5;
+     */
+    systems = new ComponentSystemRegistry();
+
+    /**
+     * Handles localization.
+     *
+     * @type {I18n}
+     */
+    i18n = new I18n(this);
+
+    /**
+     * The keyboard device.
+     *
+     * @type {Keyboard|null}
+     */
+    keyboard = null;
+
+    /**
+     * The mouse device.
+     *
+     * @type {Mouse|null}
+     */
+    mouse = null;
+
+    /**
+     * Used to get touch events input.
+     *
+     * @type {TouchDevice|null}
+     */
+    touch = null;
+
+    /**
+     * Used to access GamePad input.
+     *
+     * @type {GamePads|null}
+     */
+    gamepads = null;
+
+    /**
+     * Used to handle input for {@link ElementComponent}s.
+     *
+     * @type {ElementInput|null}
+     */
+    elementInput = null;
+
+    /**
+     * The XR Manager that provides ability to start VR/AR sessions.
+     *
+     * @type {XrManager|null}
+     * @example
+     * // check if VR is available
+     * if (app.xr.isAvailable(XRTYPE_VR)) {
+     *     // VR is available
+     * }
+     */
+    xr = null;
+
+    /**
+     * Create a new AppBase instance.
+     *
+     * @param {HTMLCanvasElement | OffscreenCanvas} canvas - The canvas element.
+     * @example
+     * const app = new AppBase(canvas);
+     *
+     * const options = new AppOptions();
+     * app.init(options);
+     *
+     * // Start the application's main loop
+     * app.start();
+     */
+    constructor(canvas) {
+        super();
+
+        // #if _DEBUG
+        if (version?.indexOf('$') < 0) {
+            Debug.log(`Powered by PlayCanvas ${version} ${revision}`);
+        }
+        // #endif
+
+        // Store application instance
+        AppBase._applications[canvas.id] = this;
+        setApplication(this);
+
+        app = this;
+
+        this.root = new Entity();
+        this.root._enabledInHierarchy = true;
+    }
+
+    /**
+     * Initialize the app.
+     *
+     * @param {AppOptions} appOptions - Options specifying the init parameters for the app.
+     */
+    init(appOptions) {
+        const {
+            assetPrefix, batchManager, componentSystems, elementInput, gamepads, graphicsDevice, keyboard,
+            lightmapper, mouse, physicsWorld, resourceHandlers, scriptsOrder, scriptPrefix, soundManager,
+            touch, xr
+        } = appOptions;
+
+        Debug.assert(graphicsDevice, 'The application cannot be created without a valid GraphicsDevice');
+        this.graphicsDevice = graphicsDevice;
+
+        // register shader chunks
+        ShaderChunks.get(graphicsDevice, SHADERLANGUAGE_GLSL).add(shaderChunksGLSL);
+        ShaderChunks.get(graphicsDevice, SHADERLANGUAGE_WGSL).add(shaderChunksWGSL);
+
+        this._initDefaultMaterial();
+        this._initProgramLibrary();
+        this._stats = new AppStats(this);
+
+        this._soundManager = soundManager;
+        this.scene = new Scene(graphicsDevice);
+        this._registerSceneImmediate(this.scene);
+
+        if (assetPrefix) this.assets.prefix = assetPrefix;
+
+        this.bundles = new BundleRegistry(this.assets);
+        this.scriptsOrder = scriptsOrder || [];
+
+        this.defaultLayerWorld = new Layer({ name: 'World', id: LAYERID_WORLD });
+        this.defaultLayerDepth = new Layer({ name: 'Depth', id: LAYERID_DEPTH, enabled: false, opaqueSortMode: SORTMODE_NONE });
+        this.defaultLayerSkybox = new Layer({ name: 'Skybox', id: LAYERID_SKYBOX, opaqueSortMode: SORTMODE_NONE });
+        this.defaultLayerUi = new Layer({ name: 'UI', id: LAYERID_UI, transparentSortMode: SORTMODE_MANUAL });
+        this.defaultLayerImmediate = new Layer({ name: 'Immediate', id: LAYERID_IMMEDIATE, opaqueSortMode: SORTMODE_NONE });
+
+        const defaultLayerComposition = new LayerComposition('default');
+        defaultLayerComposition.pushOpaque(this.defaultLayerWorld);
+        defaultLayerComposition.pushOpaque(this.defaultLayerDepth);
+        defaultLayerComposition.pushOpaque(this.defaultLayerSkybox);
+        defaultLayerComposition.pushTransparent(this.defaultLayerWorld);
+        defaultLayerComposition.pushOpaque(this.defaultLayerImmediate);
+        defaultLayerComposition.pushTransparent(this.defaultLayerImmediate);
+        defaultLayerComposition.pushTransparent(this.defaultLayerUi);
+        this.scene.layers = defaultLayerComposition;
+
+        // Placeholder texture for area light LUTs
+        AreaLightLuts.createPlaceholder(graphicsDevice);
+
+        this.renderer = new ForwardRenderer(graphicsDevice, this.scene);
+
+        if (lightmapper) {
+            this.lightmapper = new lightmapper(graphicsDevice, this.root, this.scene, this.renderer, this.assets);
+            this.once('prerender', this._firstBake, this);
+        }
+
+        if (batchManager) {
+            this._batcher = new batchManager(graphicsDevice, this.root, this.scene);
+            this.once('prerender', this._firstBatch, this);
+        }
+
+        this.keyboard = keyboard || null;
+        this.mouse = mouse || null;
+        this.touch = touch || null;
+        this.gamepads = gamepads || null;
+        if (elementInput) {
+            this.elementInput = elementInput;
+            this.elementInput.app = this;
+        }
+
+        this.xr = xr ? new xr(this) : null;
+        if (this.elementInput) this.elementInput.attachSelectEvents();
+
+        this._scriptPrefix = scriptPrefix || '';
+
+        if (this.enableBundles) {
+            this.loader.addHandler('bundle', new BundleHandler(this));
+        }
+
+        // Create and register all required resource handlers
+        resourceHandlers.forEach((resourceHandler) => {
+            const handler = new resourceHandler(this);
+            this.loader.addHandler(handler.handlerType, handler);
+        });
+
+        // default to retrying failed asset loads to make apps more resilient to transient network
+        // errors
+        this.loader.enableRetry();
+
+        // Create and register all required component systems
+        componentSystems.forEach((componentSystem) => {
+            this.systems.add(new componentSystem(this));
+        });
+
+        // Install a user-supplied physics backend. When omitted, the rigid body system
+        // auto-detects Ammo once application libraries have loaded (see onLibrariesLoaded).
+        if (physicsWorld) {
+            Debug.assert(this.systems.rigidbody, 'AppOptions.physicsWorld requires RigidBodyComponentSystem to be included in AppOptions.componentSystems.');
+            this.systems.rigidbody?.setPhysicsWorld(physicsWorld);
+        }
+
+        this._visibilityChangeHandler = this.onVisibilityChange.bind(this);
+
+        if (typeof document !== 'undefined') {
+            document.addEventListener('visibilitychange', this._visibilityChangeHandler, false);
+        }
+
+        // announce the initialized app to a devtools extension, such as the PlayCanvas Inspector,
+        // which defines this hook before the page runs, unless the app opted out. Without the hook
+        // this is a single lookup. A broken or outdated extension must not break the app, so its
+        // failures are contained
+        const hook = appOptions.devtools !== false ? globalThis[Symbol.for('playcanvas.inspector')] : undefined;
+        if (hook?.register) {
+            this._devtoolsRegistered = true;
+            try {
+                hook.register(this, { version, revision, protocol: DEVTOOLS_PROTOCOL });
+            } catch (e) {
+                Debug.warn('The devtools hook failed to register the app.', e);
+            }
+        }
+    }
+
+    static _applications = {};
+
+    /**
+     * Get the current application. In the case where there are multiple running applications, the
+     * function can get an application based on a supplied canvas id. This function is particularly
+     * useful when the current Application is not readily available. For example, in the JavaScript
+     * console of the browser's developer tools.
+     *
+     * @param {string} [id] - If defined, the returned application should use the canvas which has
+     * this id. Otherwise current application will be returned.
+     * @returns {AppBase|undefined} The running application, if any.
+     * @example
+     * const app = AppBase.getApplication();
+     */
+    static getApplication(id) {
+        return id ? AppBase._applications[id] : getApplication();
+    }
+
+    /** @private */
+    _initDefaultMaterial() {
+        const material = new StandardMaterial();
+        material.name = 'Default Material';
+        setDefaultMaterial(this.graphicsDevice, material);
+    }
+
+    /** @private */
+    _initProgramLibrary() {
+        const library = new ProgramLibrary(this.graphicsDevice);
+        setProgramLibrary(this.graphicsDevice, library);
+    }
+
+    /**
+     * @type {SoundManager}
+     * @ignore
+     */
+    get soundManager() {
+        return this._soundManager;
+    }
+
+    /**
+     * The application's batch manager. The batch manager is used to merge mesh instances in
+     * the scene, which reduces the overall number of draw calls, thereby boosting performance.
+     *
+     * @type {BatchManager}
+     */
+    get batcher() {
+        Debug.assert(this._batcher, 'BatchManager has not been created and is required for correct functionality.');
+        return this._batcher;
+    }
+
+    /**
+     * The current fill mode of the canvas. Can be:
+     *
+     * - {@link FILLMODE_NONE}: the canvas will always match the size provided.
+     * - {@link FILLMODE_FILL_WINDOW}: the canvas will simply fill the window, changing aspect ratio.
+     * - {@link FILLMODE_KEEP_ASPECT}: the canvas will grow to fill the window as best it can while
+     * maintaining the aspect ratio.
+     *
+     * @type {string}
+     */
+    get fillMode() {
+        return this._fillMode;
+    }
+
+    /**
+     * The application's performance statistics. Returns the same {@link AppStats} instance on
+     * every access. Engine measurements are read-only; {@link AppStats#user} holds writable
+     * application-defined counters. See {@link AppStats} for units, sampling and GPU profiling setup.
+     *
+     * @type {AppStats}
+     */
+    get stats() {
+        return this._stats;
+    }
+
+    /**
+     * The current resolution mode of the canvas, Can be:
+     *
+     * - {@link RESOLUTION_AUTO}: if width and height are not provided, canvas will be resized to
+     * match canvas client size.
+     * - {@link RESOLUTION_FIXED}: resolution of canvas will be fixed.
+     *
+     * @type {string}
+     */
+    get resolutionMode() {
+        return this._resolutionMode;
+    }
+
+    /**
+     * Load the application configuration file and apply application properties and fill the asset
+     * registry.
+     *
+     * @param {string} url - The URL of the configuration file to load.
+     * @param {ConfigureAppCallback} callback - The Function called when the configuration file is
+     * loaded and parsed (or an error occurs).
+     */
+    configure(url, callback) {
+        http.get(url, (err, response) => {
+            if (err) {
+                callback(err);
+                return;
+            }
+
+            const props = response.application_properties;
+            const scenes = response.scenes;
+            const assets = response.assets;
+
+            this._parseApplicationProperties(props, (err) => {
+                this._parseScenes(scenes);
+                this._parseAssets(assets);
+                if (!err) {
+                    callback(null);
+                } else {
+                    callback(err);
+                }
+            });
+        });
+    }
+
+    /**
+     * Load all assets in the asset registry that are marked as 'preload'.
+     *
+     * Container-backed render assets wait for their referenced containers to be registered and
+     * loaded. If a preloaded render asset's `data.containerAsset` refers to a container that is
+     * never registered, this method never calls its callback or fires `preload:end`. Containers
+     * can be registered in any order before this method is called. Debug builds warn about
+     * preloaded render assets whose container is still unregistered when this method is called.
+     *
+     * @param {PreloadAppCallback} callback - Function called when all assets are loaded.
+     */
+    preload(callback) {
+        this.fire('preload:start');
+
+        // get list of assets to preload
+        const assets = this.assets.list({
+            preload: true
+        });
+
+        if (assets.length === 0) {
+            this.fire('preload:end');
+            callback();
+            return;
+        }
+
+        let loadedCount = 0;
+
+        const onAssetLoadOrError = () => {
+            loadedCount++;
+            this.fire('preload:progress', loadedCount / assets.length);
+
+            if (loadedCount === assets.length) {
+                this.fire('preload:end');
+                callback();
+            }
+        };
+
+        // for each asset
+        assets.forEach((asset) => {
+            if (!asset.loaded) {
+                // A container registered after this point is still picked up, but one that is never
+                // registered keeps preload from completing.
+                Debug.call(() => {
+                    const containerId = asset.type === 'render' && asset.data.containerAsset;
+                    if (containerId && !this.assets.get(containerId)) {
+                        Debug.warnOnce(`Preloaded render asset '${asset.name}' (${asset.id}) is waiting for container asset ${containerId}, which is not registered. Preload completes only after it is registered and loaded.`);
+                    }
+                });
+
+                asset.once('load', onAssetLoadOrError);
+                asset.once('error', onAssetLoadOrError);
+                this.assets.load(asset);
+            } else {
+                onAssetLoadOrError();
+            }
+        });
+    }
+
+    _preloadScripts(sceneData, callback) {
+        callback();
+    }
+
+    // set application properties from data file
+    _parseApplicationProperties(props, callback) {
+        // configure retrying assets - overrides the default set in the constructor
+        if (typeof props.maxAssetRetries === 'number' && props.maxAssetRetries > 0) {
+            this.loader.enableRetry(props.maxAssetRetries);
+        }
+
+        // configure the concurrent request limit - overrides the default (0 is valid, meaning unlimited)
+        if (typeof props.maxConcurrentRequests === 'number' && props.maxConcurrentRequests >= 0) {
+            this.loader.maxConcurrentRequests = props.maxConcurrentRequests;
+        }
+
+        // send asset requests with credentials - applied before preloading so preloaded assets pick it up
+        if (typeof props.withCredentials === 'boolean') {
+            this.loader.withCredentials = props.withCredentials;
+        }
+
+        // TODO: remove this temporary block after migrating properties
+        if (!props.useDevicePixelRatio) {
+            props.useDevicePixelRatio = props.use_device_pixel_ratio;
+        }
+        if (!props.resolutionMode) {
+            props.resolutionMode = props.resolution_mode;
+        }
+        if (!props.fillMode) {
+            props.fillMode = props.fill_mode;
+        }
+
+        this._width = props.width;
+        this._height = props.height;
+        if (props.useDevicePixelRatio) {
+            this.graphicsDevice.maxPixelRatio = window.devicePixelRatio;
+        }
+
+        this.setCanvasResolution(props.resolutionMode, this._width, this._height);
+        this.setCanvasFillMode(props.fillMode, this._width, this._height);
+
+        // set up layers
+        if (props.layers && props.layerOrder) {
+            const composition = new LayerComposition('application');
+
+            const layers = {};
+            for (const key in props.layers) {
+                const data = props.layers[key];
+                data.id = parseInt(key, 10);
+                // depth layer should only be enabled when needed
+                // by incrementing its ref counter
+                data.enabled = data.id !== LAYERID_DEPTH;
+                layers[key] = new Layer(data);
+            }
+
+            for (let i = 0, len = props.layerOrder.length; i < len; i++) {
+                const sublayer = props.layerOrder[i];
+                const layer = layers[sublayer.layer];
+                if (!layer) continue;
+
+                if (sublayer.transparent) {
+                    composition.pushTransparent(layer);
+                } else {
+                    composition.pushOpaque(layer);
+                }
+
+                composition.subLayerEnabled[i] = sublayer.enabled;
+            }
+
+            this.scene.layers = composition;
+        }
+
+        // add batch groups
+        if (props.batchGroups) {
+            const batcher = this.batcher;
+            if (batcher) {
+                for (let i = 0, len = props.batchGroups.length; i < len; i++) {
+                    const grp = props.batchGroups[i];
+                    batcher.addGroup(grp.name, grp.dynamic, grp.maxAabbSize, grp.id, grp.layers);
+                }
+            }
+        }
+
+        // set localization assets
+        if (props.i18nAssets) {
+            this.i18n.assets = props.i18nAssets;
+        }
+
+        this._loadLibraries(props.libraries, callback);
+    }
+
+    /**
+     * @param {string[]} urls - List of URLs to load.
+     * @param {Function} callback - Callback function.
+     * @private
+     */
+    _loadLibraries(urls, callback) {
+        const len = urls.length;
+        let count = len;
+
+        const regex = /^https?:\/\//;
+
+        if (len) {
+            const onLoad = (err, script) => {
+                count--;
+                if (err) {
+                    callback(err);
+                } else if (count === 0) {
+                    this.onLibrariesLoaded();
+                    callback(null);
+                }
+            };
+
+            for (let i = 0; i < len; ++i) {
+                let url = urls[i];
+
+                if (!regex.test(url.toLowerCase()) && this._scriptPrefix) {
+                    url = path.join(this._scriptPrefix, url);
+                }
+
+                this.loader.load(url, 'script', onLoad);
+            }
+        } else {
+            this.onLibrariesLoaded();
+            callback(null);
+        }
+    }
+
+    /**
+     * Insert scene name/urls into the registry.
+     *
+     * @param {*} scenes - Scenes to add to the scene registry.
+     * @private
+     */
+    _parseScenes(scenes) {
+        if (!scenes) return;
+
+        for (let i = 0; i < scenes.length; i++) {
+            this.scenes.add(scenes[i].name, scenes[i].url);
+        }
+    }
+
+    /**
+     * Insert assets into registry.
+     *
+     * @param {*} assets - Assets to insert.
+     * @private
+     */
+    _parseAssets(assets) {
+        const list = [];
+
+        const scriptsIndex = {};
+        const bundlesIndex = {};
+
+        // add scripts in order of loading first
+        for (let i = 0; i < this.scriptsOrder.length; i++) {
+            const id = this.scriptsOrder[i];
+            if (!assets[id]) {
+                continue;
+            }
+
+            scriptsIndex[id] = true;
+            list.push(assets[id]);
+        }
+
+        // then add bundles
+        if (this.enableBundles) {
+            for (const id in assets) {
+                if (assets[id].type === 'bundle') {
+                    bundlesIndex[id] = true;
+                    list.push(assets[id]);
+                }
+            }
+        }
+
+        // then add rest of assets
+        for (const id in assets) {
+            if (scriptsIndex[id] || bundlesIndex[id]) {
+                continue;
+            }
+
+            list.push(assets[id]);
+        }
+
+        for (let i = 0; i < list.length; i++) {
+            const data = list[i];
+            const asset = new Asset(data.name, data.type, data.file, data.data);
+            asset.id = parseInt(data.id, 10);
+            asset.preload = data.preload ? data.preload : false;
+            // if this is a script asset and has already been embedded in the page then
+            // mark it as loaded
+            asset.loaded = data.type === 'script' && data.data && data.data.loadingType > 0;
+            // tags
+            asset.tags.add(data.tags);
+            // i18n
+            if (data.i18n) {
+                for (const locale in data.i18n) {
+                    asset.addLocalizedAssetId(locale, data.i18n[locale]);
+                }
+            }
+            // registry
+            this.assets.add(asset);
+        }
+    }
+
+    /**
+     * Start the application. This function does the following:
+     *
+     * 1. Fires an event on the application named 'start'
+     * 2. Calls initialize for all components on entities in the hierarchy
+     * 3. Fires an event on the application named 'initialize'
+     * 4. Calls postInitialize for all components on entities in the hierarchy
+     * 5. Fires an event on the application named 'postinitialize'
+     * 6. Starts executing the main loop of the application
+     *
+     * This function is called internally by PlayCanvas applications made in the Editor but you
+     * will need to call start yourself if you are using the engine stand-alone.
+     *
+     * The main loop is driven by `requestAnimationFrame`. Where that is unavailable, such as in
+     * Node.js, no loop runs, so call {@link update} yourself at the rate you need.
+     *
+     * @example
+     * app.start();
+     */
+    start() {
+
+        Debug.call(() => {
+            Debug.assert(!this._alreadyStarted, 'The application can be started only one time.');
+            this._alreadyStarted = true;
+        });
+
+        this.frame = 0;
+
+        this.fire('start', {
+            timestamp: now(),
+            target: this
+        });
+
+        if (!this._librariesLoaded) {
+            this.onLibrariesLoaded();
+        }
+
+        this.systems.fire('initialize', this.root);
+        this.fire('initialize');
+
+        this.systems.fire('postInitialize', this.root);
+        this.systems.fire('postPostInitialize', this.root);
+        this.fire('postinitialize');
+
+        this.requestAnimationFrame();
+    }
+
+    /**
+     * Request the next animation frame tick.
+     *
+     * @ignore
+     */
+    requestAnimationFrame() {
+        if (this.xr?.session) {
+            this.frameRequestId = this.xr.session.requestAnimationFrame(this.tick);
+        } else {
+            // without requestAnimationFrame, as in Node.js (even with jsdom), there is no main
+            // loop and the application is driven by calling update directly. A pending frame is
+            // canceled on each tick and on destroy, so both functions are required.
+            const hasFrameLoop = typeof requestAnimationFrame === 'function' &&
+                typeof cancelAnimationFrame === 'function';
+            this.frameRequestId = hasFrameLoop ? requestAnimationFrame(this.tick) : null;
+        }
+    }
+
+    /**
+     * Update all input devices managed by the application.
+     *
+     * @param {number} dt - The time in seconds since the last update.
+     * @private
+     */
+    inputUpdate(dt) {
+        if (this.mouse) {
+            this.mouse.update();
+        }
+        if (this.keyboard) {
+            this.keyboard.update();
+        }
+        if (this.gamepads) {
+            this.gamepads.update();
+        }
+    }
+
+    /**
+     * Update the application. This function will call the update functions and then the postUpdate
+     * functions of all enabled components. It will then update the current state of all connected
+     * input devices. This function is called internally in the application's main loop and does
+     * not need to be called explicitly, except where there is no main loop, such as in Node.js.
+     *
+     * @param {number} dt - The time delta in seconds since the last frame.
+     * @example
+     * // run a Node.js server at 20 updates per second
+     * setInterval(() => app.update(1 / 20), 50);
+     */
+    update(dt) {
+        this.frame++;
+
+        Debug.call(() => {
+            this.assets.log();
+        });
+
+        this.graphicsDevice.update();
+
+        this.stats.frame.updateStart = now();
+
+        // script update
+        this.stats.frame.scriptUpdateStart = now();
+        this.systems.fire(this._inTools ? 'toolsUpdate' : 'update', dt);
+        this.stats.frame.scriptUpdate = now() - this.stats.frame.scriptUpdateStart;
+
+        // animation update
+        this.stats.frame.animUpdateStart = now();
+        this.systems.fire('animationUpdate', dt);
+        this.stats.frame.animUpdate = now() - this.stats.frame.animUpdateStart;
+
+        // post update
+        this.stats.frame.scriptPostUpdateStart = now();
+        this.systems.fire('postUpdate', dt);
+        this.stats.frame.scriptPostUpdate = now() - this.stats.frame.scriptPostUpdateStart;
+
+        // fire update event
+        this.fire('update', dt);
+
+        // update input devices
+        this.inputUpdate(dt);
+
+        this.stats.frame.updateTime = now() - this.stats.frame.updateStart;
+    }
+
+    /**
+     * Render the application's scene. More specifically, the scene's {@link LayerComposition} is
+     * rendered. This function is called internally in the application's main loop and does not
+     * need to be called explicitly.
+     *
+     * @ignore
+     */
+    render() {
+        this.updateCanvasSize();
+
+        this.graphicsDevice.frameStart();
+
+        this.stats.frame.renderStart = now();
+
+        this.fire('prerender');
+        this.root.syncHierarchy();
+
+        if (this._batcher) {
+            this._batcher.updateAll();
+        }
+
+        // #if _PROFILER
+        ForwardRenderer._skipRenderCounter = 0;
+        // #endif
+
+        // render the scene composition
+        this.renderComposition(this.scene.layers);
+
+        this.fire('postrender');
+
+        this.stats.frame.renderTime = now() - this.stats.frame.renderStart;
+
+        this.graphicsDevice.frameEnd();
+    }
+
+    // render a layer composition
+    renderComposition(layerComposition) {
+        DebugGraphics.clearGpuMarkers();
+
+        // update composition + light visibility, assign atlas slots for clustered lighting
+        this.renderer.update(layerComposition);
+
+        // build the frame graph from the (not-yet-culled) composition
+        this.renderer.buildFrameGraph(this.frameGraph, layerComposition);
+
+        // cull mesh instances and shadow casters - this fills what the passes read at render time
+        this.renderer.cull(layerComposition);
+
+        this.frameGraph.render(this.graphicsDevice);
+    }
+
+    /**
+     * Controls how the canvas fills the window. The canvas is sized when this is called and on
+     * every {@link AppBase#resizeCanvas}; the engine installs no window `resize` listener of its
+     * own, so call `resizeCanvas` from your own handler to keep the window-relative modes tracking
+     * the window.
+     *
+     * @param {string} mode - The mode to use when setting the size of the canvas. Can be:
+     *
+     * - {@link FILLMODE_NONE}: the canvas will always match the size provided.
+     * - {@link FILLMODE_FILL_WINDOW}: the canvas will simply fill the window, changing aspect ratio.
+     * - {@link FILLMODE_KEEP_ASPECT}: the canvas will grow to fill the window as best it can while
+     * maintaining the aspect ratio.
+     *
+     * @param {number} [width] - The width of the canvas (only used when mode is {@link FILLMODE_NONE}).
+     * @param {number} [height] - The height of the canvas (only used when mode is {@link FILLMODE_NONE}).
+     */
+    setCanvasFillMode(mode, width, height) {
+        this._fillMode = mode;
+        this.resizeCanvas(width, height);
+    }
+
+    /**
+     * Change the resolution of the canvas, and set the way it behaves when the window is resized.
+     *
+     * @param {string} mode - The mode to use when setting the resolution. Can be:
+     *
+     * - {@link RESOLUTION_AUTO}: if width and height are not provided, canvas will be resized to
+     * match canvas client size.
+     * - {@link RESOLUTION_FIXED}: resolution of canvas will be fixed.
+     *
+     * @param {number} [width] - The horizontal resolution, optional in AUTO mode, if not provided
+     * canvas clientWidth is used.
+     * @param {number} [height] - The vertical resolution, optional in AUTO mode, if not provided
+     * canvas clientHeight is used.
+     */
+    setCanvasResolution(mode, width, height) {
+        this._resolutionMode = mode;
+
+        // In AUTO mode the resolution is the same as the canvas size, unless specified
+        if (mode === RESOLUTION_AUTO && (width === undefined)) {
+            width = this.graphicsDevice.canvas.clientWidth;
+            height = this.graphicsDevice.canvas.clientHeight;
+        }
+
+        this.graphicsDevice.resizeCanvas(width, height);
+    }
+
+    /**
+     * Queries the visibility of the window or tab in which the application is running.
+     *
+     * @returns {boolean} True if the application is not visible and false otherwise.
+     */
+    isHidden() {
+        return document.hidden;
+    }
+
+    /**
+     * Called when the visibility state of the current tab/window changes.
+     *
+     * @private
+     */
+    onVisibilityChange() {
+        if (this.isHidden()) {
+            if (this._soundManager) {
+                this._soundManager.suspend();
+            }
+        } else {
+            if (this._soundManager) {
+                this._soundManager.resume();
+            }
+        }
+    }
+
+    /**
+     * Resize the application's canvas element in line with the current fill mode.
+     *
+     * - In {@link FILLMODE_KEEP_ASPECT} mode, the canvas will grow to fill the window as best it
+     * can while maintaining the aspect ratio.
+     * - In {@link FILLMODE_FILL_WINDOW} mode, the canvas will simply fill the window, changing
+     * aspect ratio.
+     * - In {@link FILLMODE_NONE} mode, the canvas will always match the size provided.
+     *
+     * @param {number} [width] - The width of the canvas. Only used if current fill mode is {@link FILLMODE_NONE}.
+     * @param {number} [height] - The height of the canvas. Only used if current fill mode is {@link FILLMODE_NONE}.
+     * @returns {{width: number, height: number}|undefined} An object containing the values
+     * calculated to use as width and height, or `undefined` if resizing is not allowed or an XR
+     * session is active.
+     */
+    resizeCanvas(width, height) {
+        if (!this._allowResize) return undefined; // prevent resizing (e.g. if presenting in VR HMD)
+
+        // prevent resizing when in XR session
+        if (this.xr && this.xr.session) {
+            return undefined;
+        }
+
+        const windowWidth = window.innerWidth;
+        const windowHeight = window.innerHeight;
+
+        if (this._fillMode === FILLMODE_KEEP_ASPECT) {
+            const r = this.graphicsDevice.canvas.width / this.graphicsDevice.canvas.height;
+            const winR = windowWidth / windowHeight;
+
+            if (r > winR) {
+                width = windowWidth;
+                height = width / r;
+            } else {
+                height = windowHeight;
+                width = height * r;
+            }
+        } else if (this._fillMode === FILLMODE_FILL_WINDOW) {
+            width = windowWidth;
+            height = windowHeight;
+        }
+        // OTHERWISE: FILLMODE_NONE use width and height that are provided
+
+        this.graphicsDevice.canvas.style.width = `${width}px`;
+        this.graphicsDevice.canvas.style.height = `${height}px`;
+
+        this.updateCanvasSize();
+
+        // return the final values calculated for width and height
+        return {
+            width: width,
+            height: height
+        };
+    }
+
+    /**
+     * Updates the {@link GraphicsDevice} canvas size to match the canvas size on the document
+     * page. It is recommended to call this function when the canvas size changes (e.g on window
+     * resize and orientation change events) so that the canvas resolution is immediately updated.
+     */
+    updateCanvasSize() {
+        // Don't update if we are in VR or XR
+        if ((!this._allowResize) || (this.xr?.active)) {
+            return;
+        }
+
+        // In AUTO mode the resolution is changed to match the canvas size
+        if (this._resolutionMode === RESOLUTION_AUTO) {
+            // Check if the canvas DOM has changed size
+            const canvas = this.graphicsDevice.canvas;
+            this.graphicsDevice.resizeCanvas(canvas.clientWidth, canvas.clientHeight);
+        }
+    }
+
+    /**
+     * Event handler called when all code libraries have been loaded. Code libraries are passed
+     * into the constructor of the Application and the application won't start running or load
+     * packs until all libraries have been loaded.
+     *
+     * @private
+     */
+    onLibrariesLoaded() {
+        this._librariesLoaded = true;
+
+        if (this.systems.rigidbody) {
+            this.systems.rigidbody.onLibraryLoaded();
+        }
+    }
+
+    /**
+     * Apply scene settings to the current scene. Useful when your scene settings are parsed or
+     * generated from a non-URL source.
+     *
+     * @param {object} settings - The scene settings to be applied.
+     * @param {object} settings.physics - The physics settings to be applied.
+     * @param {number[]} settings.physics.gravity - The world space vector representing global
+     * gravity in the physics simulation. Must be a fixed size array with three number elements,
+     * corresponding to each axis [ X, Y, Z ].
+     * @param {object} settings.render - The rendering settings to be applied.
+     * @param {number[]} settings.render.global_ambient - The color of the scene's ambient light.
+     * Must be a fixed size array with three number elements, corresponding to each color channel
+     * [ R, G, B ].
+     * @param {string} settings.render.fog - The type of fog used by the scene. Can be:
+     *
+     * - {@link FOG_NONE}
+     * - {@link FOG_LINEAR}
+     * - {@link FOG_EXP}
+     * - {@link FOG_EXP2}
+     *
+     * @param {number[]} settings.render.fog_color - The color of the fog (if enabled). Must be a
+     * fixed size array with three number elements, corresponding to each color channel [ R, G, B ].
+     * @param {number} settings.render.fog_density - The density of the fog (if enabled). This
+     * property is only valid if the fog property is set to {@link FOG_EXP} or {@link FOG_EXP2}.
+     * @param {number} settings.render.fog_start - The distance from the viewpoint where linear fog
+     * begins. This property is only valid if the fog property is set to {@link FOG_LINEAR}.
+     * @param {number} settings.render.fog_end - The distance from the viewpoint where linear fog
+     * reaches its maximum. This property is only valid if the fog property is set to {@link FOG_LINEAR}.
+     * @param {number} settings.render.gamma_correction - The gamma correction to apply when
+     * rendering the scene. Can be:
+     *
+     * - {@link GAMMA_NONE}
+     * - {@link GAMMA_SRGB}
+     *
+     * @param {number} settings.render.tonemapping - The tonemapping transform to apply when
+     * writing fragments to the frame buffer. Can be:
+     *
+     * - {@link TONEMAP_LINEAR}
+     * - {@link TONEMAP_FILMIC}
+     * - {@link TONEMAP_HEJL}
+     * - {@link TONEMAP_ACES}
+     * - {@link TONEMAP_ACES2}
+     * - {@link TONEMAP_NEUTRAL}
+     * - {@link TONEMAP_AGX}
+     * - {@link TONEMAP_AGX_PUNCHY}
+     *
+     * @param {number} settings.render.exposure - The exposure value tweaks the overall brightness
+     * of the scene.
+     * @param {number|null} [settings.render.skybox] - The asset ID of the cube map texture to be
+     * used as the scene's skybox. Defaults to null.
+     * @param {number} [settings.render.skyboxIntensity] - Multiplier for skybox intensity. Defaults to 1.
+     * @param {number} [settings.render.skyboxLuminance] - Lux (lm/m^2) value for skybox intensity when physical light units are enabled. Defaults to 20000.
+     * @param {number} [settings.render.skyboxMip] - The mip level of the skybox to be displayed. Defaults to 0.
+     * Only valid for prefiltered cubemap skyboxes.
+     * @param {number[]} [settings.render.skyboxRotation] - Rotation of skybox. Defaults to [0, 0, 0].
+     *
+     * @param {string} [settings.render.skyType] - The type of the sky. One of the SKYTYPE_* constants. Defaults to {@link SKYTYPE_INFINITE}.
+     * @param {number[]} [settings.render.skyMeshPosition] - The position of sky mesh. Ignored for {@link SKYTYPE_INFINITE}. Defaults to [0, 0, 0].
+     * @param {number[]} [settings.render.skyMeshRotation] - The rotation of sky mesh. Ignored for {@link SKYTYPE_INFINITE}. Defaults to [0, 0, 0].
+     * @param {number[]} [settings.render.skyMeshScale] - The scale of sky mesh. Ignored for {@link SKYTYPE_INFINITE}. Defaults to [1, 1, 1].
+     * @param {number[]} [settings.render.skyCenter] - The center of the sky. Ignored for {@link SKYTYPE_INFINITE}. Defaults to [0, 1, 0].
+     *
+     * @param {number} settings.render.lightmapSizeMultiplier - The lightmap resolution multiplier.
+     * @param {number} settings.render.lightmapMaxResolution - The maximum lightmap resolution.
+     * @param {number} settings.render.lightmapMode - The lightmap baking mode. Can be:
+     *
+     * - {@link BAKE_COLOR}: single color lightmap
+     * - {@link BAKE_COLORDIR}: single color lightmap + dominant light direction (used for bump/specular)
+     *
+     * @param {boolean} [settings.render.lightmapFilterEnabled] - Enables bilateral filter on runtime baked color lightmaps. Defaults to false.
+     * @param {number} [settings.render.lightmapFilterRange] - Sets the range parameter of the bilateral filter. Defaults to 10.
+     * @param {number} [settings.render.lightmapFilterSmoothness] - Sets the spatial parameter of the bilateral filter. Defaults to 0.2.
+     *
+     * @param {boolean} [settings.render.ambientBake] - Enable baking ambient light into lightmaps. Defaults to false.
+     * @param {number} [settings.render.ambientBakeNumSamples] - Number of samples to use when baking ambient light. Defaults to 1.
+     * @param {number} [settings.render.ambientBakeSpherePart] - How much of the sphere to include when baking ambient light. Defaults to 0.4.
+     * @param {number} [settings.render.ambientBakeOcclusionBrightness] - Brightness of the baked ambient occlusion. Defaults to 0.
+     * @param {number} [settings.render.ambientBakeOcclusionContrast] - Contrast of the baked ambient occlusion. Defaults to 0.
+     * @param {number} settings.render.ambientLuminance - Lux (lm/m^2) value for ambient light intensity.
+     *
+     * @param {boolean} [settings.render.clusteredLightingEnabled] - Enable clustered lighting. Defaults to false.
+     * @param {boolean} [settings.render.lightingShadowsEnabled] - If set to true, the clustered lighting will support shadows. Defaults to true.
+     * @param {boolean} [settings.render.lightingCookiesEnabled] - If set to true, the clustered lighting will support cookie textures. Defaults to false.
+     * @param {boolean} [settings.render.lightingAreaLightsEnabled] - If set to true, the clustered lighting will support area lights. Defaults to false.
+     * @param {number} [settings.render.lightingShadowAtlasResolution] - Resolution of the atlas texture storing all non-directional shadow textures. Defaults to 2048.
+     * @param {number} [settings.render.lightingCookieAtlasResolution] - Resolution of the atlas texture storing all non-directional cookie textures. Defaults to 2048.
+     * @param {number} [settings.render.lightingMaxLightsPerCell] - Maximum number of lights a cell can store. Defaults to 255.
+     * @param {number} [settings.render.lightingMaxLights] - Maximum number of lights the clustered lighting can use in a single
+     * frame. Keep this as low as the scene allows, as a larger value has a per-frame cost. The value is limited by the maximum
+     * texture size supported by the device. Defaults to 255.
+     * @param {number} [settings.render.lightingShadowType] - The type of shadow filtering used by all shadows. Can be:
+     *
+     * - {@link SHADOW_PCF1_32F}
+     * - {@link SHADOW_PCF3_32F}
+     * - {@link SHADOW_PCF5_32F}
+     * - {@link SHADOW_PCF1_16F}
+     * - {@link SHADOW_PCF3_16F}
+     * - {@link SHADOW_PCF5_16F}
+     *
+     * Defaults to {@link SHADOW_PCF3_32F}.
+     * @param {number[]} [settings.render.lightingCells] - Number of cells along each world space axis the space containing lights
+     * is subdivided into. Defaults to [10, 3, 10].
+     *
+     * Only lights with bakeDir=true will be used for generating the dominant light direction.
+     * @param {boolean} [settings.render.gsplatRadialSorting] - Enables radial sorting of Gaussian splats. Defaults to false.
+     * @param {number} [settings.render.gsplatLodUpdateDistance] - Distance threshold in world units to trigger gsplat LOD updates. Defaults to 1.
+     * @param {number} [settings.render.gsplatLodUpdateAngle] - Angle threshold in degrees to trigger gsplat LOD updates based on camera rotation. Defaults to 90.
+     * @param {number} [settings.render.gsplatLodBehindPenalty] - Multiplier applied to effective distance for gsplat nodes behind the camera. Defaults to 1.5.
+     * @param {number} [settings.render.gsplatLodUnderfillLimit] - Maximum number of gsplat LOD levels allowed below the optimal level when optimal data is not resident. Defaults to 0.
+     * @param {number} [settings.render.gsplatSplatBudget] - Number of splats across all GSplats in the scene, used as set by `gsplatSplatBudgetMode`. 0 means no budget. Defaults to 1000000.
+     * @param {string} [settings.render.gsplatSplatBudgetMode] - How the splat budget is used for streamed GSplats: 'target' (default) raises detail until the budget is used up; 'limit' lets the LOD distances of each GSplat decide the detail and only lowers it when they would exceed the budget.
+     * @param {number} [settings.render.gsplatAlphaClip] - Alpha threshold for gsplat shadow, pick, and prepass rendering. Defaults to 0.3.
+     * @param {number} [settings.render.gsplatAlphaClipForward] - Alpha threshold for the forward gsplat rendering pass. Defaults to 1 / 255.
+     * @param {number} [settings.render.gsplatMinPixelSize] - Minimum screen-space pixel size below which splats are discarded. Defaults to 2.
+     * @param {number} [settings.render.gsplatMinContribution] - Minimum visual contribution threshold for the compute gsplat renderer. Defaults to 2.
+     * @param {number} [settings.render.gsplatFoveationStrength] - Foveated contribution culling strength. Defaults to 0.
+     * @param {number} [settings.render.gsplatFoveationCenter] - Protected center radius for foveated contribution culling. Defaults to 0.3.
+     * @param {boolean} [settings.render.gsplatAntiAlias] - Whether Gaussian splats are rendered with anti-aliasing compensation. When
+     * not set, each splat follows its resource; see {@link GSplatParams#antiAlias}.
+     * @param {boolean} [settings.render.gsplatUseFog] - Whether to apply scene fog to Gaussian splats. Defaults to true.
+     * @param {boolean} [settings.render.gsplatUseTonemap] - Whether to apply the camera's tonemapping and the
+     * scene exposure to Gaussian splats. Defaults to true.
+     * @param {number} [settings.render.gsplatColorUpdateAngle] - Viewing angle threshold in degrees for triggering gsplat spherical harmonics color updates. Defaults to 10.
+     * @param {number} [settings.render.gsplatCooldownTicks] - Number of update ticks before unloading unused streamed gsplat resources. Defaults to 100.
+     * @param {string} [settings.render.gsplatDataFormat] - Work buffer data format for gsplat rendering. One of the GSPLATDATA_* constants. Defaults to {@link GSPLATDATA_COMPACT}.
+     * @param {boolean} [settings.render.gsplatEnableIds] - Enables per-component ID storage in the gsplat work buffer. Defaults to false.
+     * @example
+     *
+     * const settings = {
+     *     physics: {
+     *         gravity: [0, -9.8, 0]
+     *     },
+     *     render: {
+     *         fog_end: 1000,
+     *         tonemapping: 0,
+     *         skybox: null,
+     *         fog_density: 0.01,
+     *         gamma_correction: 1,
+     *         exposure: 1,
+     *         fog_start: 1,
+     *         global_ambient: [0, 0, 0],
+     *         skyboxIntensity: 1,
+     *         skyboxRotation: [0, 0, 0],
+     *         fog_color: [0, 0, 0],
+     *         lightmapMode: 1,
+     *         fog: 'none',
+     *         lightmapMaxResolution: 2048,
+     *         skyboxMip: 2,
+     *         lightmapSizeMultiplier: 16
+     *     }
+     * };
+     * app.applySceneSettings(settings);
+     */
+    applySceneSettings(settings) {
+        let asset;
+
+        // gravity is engine state - the physics backend applies it when present
+        if (this.systems.rigidbody) {
+            const [x, y, z] = settings.physics.gravity;
+            this.systems.rigidbody.gravity.set(x, y, z);
+        }
+
+        this.scene.applySettings(settings);
+
+        if (settings.render.hasOwnProperty('skybox')) {
+            if (settings.render.skybox) {
+                asset = this.assets.get(settings.render.skybox);
+
+                if (asset) {
+                    this.setSkybox(asset);
+                } else {
+                    this.assets.once(`add:${settings.render.skybox}`, this.setSkybox, this);
+                }
+            } else {
+                this.setSkybox(null);
+            }
+        }
+    }
+
+    /**
+     * Sets the area light LUT tables for this app.
+     *
+     * @param {number[]} ltcMat1 - LUT table of type `array` to be set.
+     * @param {number[]} ltcMat2 - LUT table of type `array` to be set.
+     */
+    setAreaLightLuts(ltcMat1, ltcMat2) {
+
+        if (ltcMat1 && ltcMat2) {
+            AreaLightLuts.set(this.graphicsDevice, ltcMat1, ltcMat2);
+        } else {
+            Debug.warn('setAreaLightLuts: LUTs for area light are not valid');
+        }
+    }
+
+    /**
+     * Sets the skybox asset to current scene, and subscribes to asset load/change events.
+     *
+     * @param {Asset} asset - Asset of type `skybox` to be set to, or null to remove skybox.
+     */
+    setSkybox(asset) {
+        if (asset !== this._skyboxAsset) {
+            // cleanup previous asset
+            if (this._skyboxAsset) {
+                this.assets.off(`load:${this._skyboxAsset.id}`, this._onSkyboxChanged, this);
+                this.assets.off(`remove:${this._skyboxAsset.id}`, this._onSkyboxRemoved, this);
+                this._skyboxAsset.off('change', this._onSkyboxChanged, this);
+            }
+
+            // set new asset
+            this._skyboxAsset = asset;
+            if (this._skyboxAsset) {
+                this.assets.on(`load:${this._skyboxAsset.id}`, this._onSkyboxChanged, this);
+                this.assets.once(`remove:${this._skyboxAsset.id}`, this._onSkyboxRemoved, this);
+                this._skyboxAsset.on('change', this._onSkyboxChanged, this);
+
+                if (this.scene.skyboxMip === 0 && !this._skyboxAsset.loadFaces) {
+                    this._skyboxAsset.loadFaces = true;
+                }
+
+                this.assets.load(this._skyboxAsset);
+            }
+
+            this._onSkyboxChanged();
+        }
+    }
+
+    /** @private */
+    _onSkyboxRemoved() {
+        this.setSkybox(null);
+    }
+
+    /** @private */
+    _onSkyboxChanged() {
+        this.scene.setSkybox(this._skyboxAsset ? this._skyboxAsset.resources : null);
+    }
+
+    /** @private */
+    _firstBake() {
+        this.lightmapper?.bake(null, this.scene.lightmapMode);
+    }
+
+    /** @private */
+    _firstBatch() {
+        this.batcher?.generate();
+    }
+
+    /**
+     * Provide an opportunity to modify the timestamp supplied by requestAnimationFrame.
+     *
+     * @param {number} [timestamp] - The timestamp supplied by requestAnimationFrame.
+     * @returns {number|undefined} The modified timestamp.
+     * @ignore
+     */
+    _processTimestamp(timestamp) {
+        return timestamp;
+    }
+
+    /**
+     * Draws a single line. Line start and end coordinates are specified in world space. The line
+     * will be flat-shaded with the specified color.
+     *
+     * @param {Vec3} start - The start world space coordinate of the line.
+     * @param {Vec3} end - The end world space coordinate of the line.
+     * @param {Color} [color] - The color of the line, specified in sRGB color space. It defaults
+     * to white if not specified.
+     * @param {boolean} [depthTest] - Specifies if the line is depth tested against the depth
+     * buffer. Defaults to true.
+     * @param {Layer} [layer] - The layer to render the line into. Defaults to {@link LAYERID_IMMEDIATE}.
+     * @example
+     * // Render a 1-unit long white line
+     * const start = new Vec3(0, 0, 0);
+     * const end = new Vec3(1, 0, 0);
+     * app.drawLine(start, end);
+     * @example
+     * // Render a 1-unit long red line which is not depth tested and renders on top of other geometry
+     * const start = new Vec3(0, 0, 0);
+     * const end = new Vec3(1, 0, 0);
+     * app.drawLine(start, end, Color.RED, false);
+     * @example
+     * // Render a 1-unit long white line into the world layer
+     * const start = new Vec3(0, 0, 0);
+     * const end = new Vec3(1, 0, 0);
+     * const worldLayer = app.scene.layers.getLayerById(LAYERID_WORLD);
+     * app.drawLine(start, end, Color.WHITE, true, worldLayer);
+     */
+    drawLine(start, end, color, depthTest, layer) {
+        this.scene.drawLine(start, end, color, depthTest, layer);
+    }
+
+    /**
+     * Renders an arbitrary number of discrete line segments. The lines are not connected by each
+     * subsequent point in the array. Instead, they are individual segments specified by two
+     * points. Therefore, the lengths of the supplied position and color arrays must be the same
+     * and also must be a multiple of 2. The colors of the ends of each line segment will be
+     * interpolated along the length of each line.
+     *
+     * @param {Vec3[]} positions - An array of points to draw lines between. The length of the
+     * array must be a multiple of 2.
+     * @param {Color[] | Color} colors - An array of colors or a single color. If an array is
+     * specified, this must be the same length as the position array. The length of the array
+     * must also be a multiple of 2.
+     * @param {boolean} [depthTest] - Specifies if the lines are depth tested against the depth
+     * buffer. Defaults to true.
+     * @param {Layer} [layer] - The layer to render the lines into. Defaults to {@link LAYERID_IMMEDIATE}.
+     * @example
+     * // Render a single line, with unique colors for each point
+     * const start = new Vec3(0, 0, 0);
+     * const end = new Vec3(1, 0, 0);
+     * app.drawLines([start, end], [Color.RED, Color.WHITE]);
+     * @example
+     * // Render 2 discrete line segments
+     * const points = [
+     *     // Line 1
+     *     new Vec3(0, 0, 0),
+     *     new Vec3(1, 0, 0),
+     *     // Line 2
+     *     new Vec3(1, 1, 0),
+     *     new Vec3(1, 1, 1)
+     * ];
+     * const colors = [
+     *     // Line 1
+     *     Color.RED,
+     *     Color.YELLOW,
+     *     // Line 2
+     *     Color.CYAN,
+     *     Color.BLUE
+     * ];
+     * app.drawLines(points, colors);
+     */
+    drawLines(positions, colors, depthTest = true, layer = this.scene.defaultDrawLayer) {
+        this.scene.drawLines(positions, colors, depthTest, layer);
+    }
+
+    /**
+     * Renders an arbitrary number of discrete line segments. The lines are not connected by each
+     * subsequent point in the array. Instead, they are individual segments specified by two
+     * points.
+     *
+     * @param {number[]} positions - An array of points to draw lines between. Each point is
+     * represented by 3 numbers - x, y and z coordinate.
+     * @param {number[]|Color} colors - A single color for all lines, or an array of colors to color
+     * the lines. If an array is specified, the number of colors it stores must match the number
+     * of positions provided.
+     * @param {boolean} [depthTest] - Specifies if the lines are depth tested against the depth
+     * buffer. Defaults to true.
+     * @param {Layer} [layer] - The layer to render the lines into. Defaults to {@link LAYERID_IMMEDIATE}.
+     * @example
+     * // Render 2 discrete line segments
+     * const points = [
+     *     // Line 1
+     *     0, 0, 0,
+     *     1, 0, 0,
+     *     // Line 2
+     *     1, 1, 0,
+     *     1, 1, 1
+     * ];
+     * const colors = [
+     *     // Line 1
+     *     1, 0, 0, 1,  // red
+     *     0, 1, 0, 1,  // green
+     *     // Line 2
+     *     0, 0, 1, 1,  // blue
+     *     1, 1, 1, 1   // white
+     * ];
+     * app.drawLineArrays(points, colors);
+     */
+    drawLineArrays(positions, colors, depthTest = true, layer = this.scene.defaultDrawLayer) {
+        this.scene.drawLineArrays(positions, colors, depthTest, layer);
+    }
+
+    /**
+     * @deprecated Use {@link WireRenderer#sphere} instead.
+     * @ignore
+     */
+    drawWireSphere() {
+        Debug.removed('AppBase#drawWireSphere is removed. Use WireRenderer#sphere instead.');
+    }
+
+    /**
+     * @deprecated Use {@link WireRenderer#boxMinMax} instead.
+     * @ignore
+     */
+    drawWireAlignedBox() {
+        Debug.removed('AppBase#drawWireAlignedBox is removed. Use WireRenderer#boxMinMax instead.');
+    }
+
+    drawMeshInstance() {
+        Debug.removed('AppBase#drawMeshInstance is removed. Use Layer#addMeshInstances instead.');
+    }
+
+    drawMesh() {
+        Debug.removed('AppBase#drawMesh is removed. Create a MeshInstance and use Layer#addMeshInstances instead.');
+    }
+
+    drawQuad() {
+        Debug.removed('AppBase#drawQuad is removed. Create a quad MeshInstance and use Layer#addMeshInstances, or use TextureRenderer#draw for texture previews.');
+    }
+
+    drawTexture() {
+        Debug.removed('AppBase#drawTexture is removed. Use TextureRenderer#draw instead.');
+    }
+
+    drawDepthTexture() {
+        Debug.removed('AppBase#drawDepthTexture is removed. Use TextureRenderer#sceneDepth instead.');
+    }
+
+    /**
+     * Destroys application and removes all event listeners at the end of the current engine frame
+     * update. However, if called outside of the engine frame update, calling destroy() will
+     * destroy the application immediately.
+     *
+     * On WebGL, the canvas keeps its WebGL context until the canvas is garbage collected. Browsers
+     * limit the number of live WebGL contexts on a page, and beyond the limit they lose the oldest
+     * one, which can belong to another running application. A page that destroys applications
+     * whose canvases it doesn't reuse can release the context, as shown below. A released context
+     * can't be used by a new application on the same canvas.
+     *
+     * @example
+     * app.destroy();
+     *
+     * // on WebGL, also release the context of a canvas that won't be reused
+     * canvas.getContext('webgl2')?.getExtension('WEBGL_lose_context')?.loseContext();
+     */
+    destroy() {
+        if (this._inFrameUpdate) {
+            this._destroyRequested = true;
+            return;
+        }
+
+        // only an app that announced itself withdraws
+        if (this._devtoolsRegistered) {
+            this._devtoolsRegistered = false;
+            try {
+                globalThis[Symbol.for('playcanvas.inspector')]?.unregister?.(this);
+            } catch (e) {
+                Debug.warn('The devtools hook failed to unregister the app.', e);
+            }
+        }
+
+        const canvasId = this.graphicsDevice.canvas.id;
+
+        this.fire('destroy', this); // fire destroy event
+        this.off('librariesloaded');
+
+        // Clean up gsplat sort timing event listener
+        this._gsplatSortedEvt?.off();
+        this._gsplatSortedEvt = null;
+
+        if (typeof document !== 'undefined') {
+            document.removeEventListener('visibilitychange', this._visibilityChangeHandler, false);
+        }
+        this._visibilityChangeHandler = null;
+
+        this.root.destroy();
+        this.root = null;
+
+        if (this.mouse) {
+            this.mouse.off();
+            this.mouse.detach();
+            this.mouse = null;
+        }
+
+        if (this.keyboard) {
+            this.keyboard.off();
+            this.keyboard.detach();
+            this.keyboard = null;
+        }
+
+        if (this.touch) {
+            this.touch.off();
+            this.touch.detach();
+            this.touch = null;
+        }
+
+        if (this.elementInput) {
+            this.elementInput.detach();
+            this.elementInput = null;
+        }
+
+        if (this.gamepads) {
+            this.gamepads.destroy();
+            this.gamepads = null;
+        }
+
+        this.systems.destroy();
+
+        // destroy bundle registry
+        this.bundles.destroy();
+        this.bundles = null;
+
+        this.i18n.destroy();
+        this.i18n = null;
+
+        const scriptHandler = this.loader.getHandler('script');
+        scriptHandler?.clearCache();
+
+        this.loader.destroy();
+        this.loader = null;
+
+        this.systems = null;
+        this.context = null;
+
+        // script registry
+        this.scripts.destroy();
+        this.scripts = null;
+
+        this.scenes.destroy();
+        this.scenes = null;
+
+        this.lightmapper?.destroy();
+        this.lightmapper = null;
+
+        if (this._batcher) {
+            this._batcher.destroy();
+            this._batcher = null;
+        }
+
+        this._entityIndex = {};
+
+        this.defaultLayerDepth.onDisable = null;
+        this.defaultLayerDepth.onEnable = null;
+        this.defaultLayerDepth = null;
+        this.defaultLayerWorld = null;
+
+        this.xr?.end();
+        this.xr?.destroy();
+
+        this.renderer.destroy();
+        this.renderer = null;
+
+        // destroy all resources. Do this after managers have been destroyed
+        const assets = this.assets.list();
+        for (let i = 0; i < assets.length; i++) {
+            assets[i].unload();
+            assets[i].off();
+        }
+        this.assets.destroy();
+        this.assets = null;
+
+        // destroy scene after assets are unloaded (components need scene.layers during asset cleanup)
+        this.scene.destroy();
+        this.scene = null;
+
+        this.graphicsDevice.destroy();
+        this.graphicsDevice = null;
+
+        this.off(); // remove all events
+
+        this._soundManager?.destroy();
+        this._soundManager = null;
+
+        script.app = null;
+
+        // another application registered under the same canvas id since keeps its entry
+        if (AppBase._applications[canvasId] === this) {
+            AppBase._applications[canvasId] = null;
+        }
+
+        if (getApplication() === this) {
+            setApplication(null);
+        }
+
+        // clear the module scoped reference, which would otherwise keep the destroyed application
+        // alive. Skipped if another application has already taken over.
+        if (app === this) {
+            app = null;
+        }
+
+        AppBase.cancelTick(this);
+    }
+
+    static cancelTick(app) {
+        if (app.frameRequestId) {
+            cancelAnimationFrame(app.frameRequestId);
+            app.frameRequestId = undefined;
+        }
+    }
+
+    /**
+     * Get entity from the index by guid.
+     *
+     * @param {string} guid - The GUID to search for.
+     * @returns {Entity} The Entity with the GUID or null.
+     * @ignore
+     */
+    getEntityFromIndex(guid) {
+        return this._entityIndex[guid];
+    }
+
+    /**
+     * @param {Scene} scene - The scene.
+     * @private
+     */
+    _registerSceneImmediate(scene) {
+        this.on('postrender', scene.immediate.onPostRender, scene.immediate);
+
+        // Listen for gsplat sort timing events and accumulate
+        this._gsplatSortedEvt = scene.on('gsplat:sorted', (sortTime) => {
+            this.stats.frame.gsplatSort += sortTime;
+        });
+    }
+
+    /**
+     * Reports whether the document is in fullscreen mode.
+     *
+     * @returns {boolean} True if the document is in fullscreen.
+     * @ignore
+     * @deprecated Use the Fullscreen API directly.
+     */
+    isFullscreen() {
+        Debug.deprecated('AppBase#isFullscreen is deprecated. Use the Fullscreen API directly.');
+
+        return !!document.fullscreenElement;
+    }
+
+    /**
+     * Requests fullscreen mode on the given element.
+     *
+     * @param {Element} [element] - The element to make fullscreen. Defaults to the graphics
+     * device canvas.
+     * @param {Function} [success] - Called once fullscreen has been entered.
+     * @param {Function} [error] - Called if entering fullscreen fails.
+     * @ignore
+     * @deprecated Use the Fullscreen API directly.
+     */
+    enableFullscreen(element, success, error) {
+        Debug.deprecated('AppBase#enableFullscreen is deprecated. Use the Fullscreen API directly.');
+
+        element = element || this.graphicsDevice.canvas;
+
+        // success callback
+        const s = function () {
+            success();
+            document.removeEventListener('fullscreenchange', s);
+        };
+
+        // error callback
+        const e = function () {
+            error();
+            document.removeEventListener('fullscreenerror', e);
+        };
+
+        if (success) {
+            document.addEventListener('fullscreenchange', s, false);
+        }
+
+        if (error) {
+            document.addEventListener('fullscreenerror', e, false);
+        }
+
+        if (element.requestFullscreen) {
+            element.requestFullscreen(Element.ALLOW_KEYBOARD_INPUT);
+        } else {
+            error();
+        }
+    }
+
+    /**
+     * Exits fullscreen mode.
+     *
+     * @param {Function} [success] - Called once fullscreen has been exited.
+     * @ignore
+     * @deprecated Use the Fullscreen API directly.
+     */
+    disableFullscreen(success) {
+        Debug.deprecated('AppBase#disableFullscreen is deprecated. Use the Fullscreen API directly.');
+
+        // success callback
+        const s = function () {
+            success();
+            document.removeEventListener('fullscreenchange', s);
+        };
+
+        if (success) {
+            document.addEventListener('fullscreenchange', s, false);
+        }
+
+        document.exitFullscreen();
+    }
+
+    /**
+     * Gets the URL of a scene by name.
+     *
+     * @param {string} name - The name of the scene.
+     * @returns {string|null} The URL of the scene, or null if not found.
+     * @ignore
+     * @deprecated Use {@link AppBase#scenes} and {@link SceneRegistry#find} instead.
+     */
+    getSceneUrl(name) {
+        Debug.deprecated('AppBase#getSceneUrl is deprecated. Use AppBase#scenes and SceneRegistry#find instead.');
+        const entry = this.scenes.find(name);
+        if (entry) {
+            return entry.url;
+        }
+        return null;
+    }
+
+    /**
+     * Loads a scene.
+     *
+     * @param {string} url - The URL of the scene file.
+     * @param {Function} callback - Called when the scene has loaded.
+     * @ignore
+     * @deprecated Use {@link AppBase#scenes} and {@link SceneRegistry#loadScene} instead.
+     */
+    loadScene(url, callback) {
+        Debug.deprecated('AppBase#loadScene is deprecated. Use AppBase#scenes and SceneRegistry#loadScene instead.');
+        this.scenes.loadScene(url, callback);
+    }
+
+    /**
+     * Loads a scene hierarchy.
+     *
+     * @param {string} url - The URL of the scene file.
+     * @param {Function} callback - Called when the scene hierarchy has loaded.
+     * @ignore
+     * @deprecated Use {@link AppBase#scenes} and {@link SceneRegistry#loadSceneHierarchy} instead.
+     */
+    loadSceneHierarchy(url, callback) {
+        Debug.deprecated('AppBase#loadSceneHierarchy is deprecated. Use AppBase#scenes and SceneRegistry#loadSceneHierarchy instead.');
+        this.scenes.loadSceneHierarchy(url, callback);
+    }
+
+    /**
+     * Loads scene settings.
+     *
+     * @param {string} url - The URL of the scene file.
+     * @param {Function} callback - Called when the scene settings have loaded.
+     * @ignore
+     * @deprecated Use {@link AppBase#scenes} and {@link SceneRegistry#loadSceneSettings} instead.
+     */
+    loadSceneSettings(url, callback) {
+        Debug.deprecated('AppBase#loadSceneSettings is deprecated. Use AppBase#scenes and SceneRegistry#loadSceneSettings instead.');
+        this.scenes.loadSceneSettings(url, callback);
+    }
+}
+
+export { app, AppBase };
+
+// ForwardRenderer#renderComposition is deprecated and patched here, rather than declared on the
+// class, because it needs getApplication and scene code must not import from framework.
+ForwardRenderer.prototype.renderComposition = function (comp) {
+    Debug.deprecated('ForwardRenderer#renderComposition is deprecated. Use AppBase.renderComposition instead.');
+    getApplication().renderComposition(comp);
+};

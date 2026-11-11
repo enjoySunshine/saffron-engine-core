@@ -1,0 +1,1172 @@
+import { EventHandler } from '../../core/event-handler.js';
+import { math } from '../../core/math/math.js';
+
+/**
+ * @import { SoundManager } from './manager.js'
+ * @import { Sound } from './sound.js'
+ */
+
+const STATE_PLAYING = 0;
+const STATE_PAUSED = 1;
+const STATE_STOPPED = 2;
+
+// A scheduled stop cannot be canceled through the Web Audio API, only replaced by a later one, so
+// an unwanted stop is pushed this many seconds into the future instead.
+const STOP_NEVER_DELAY = 1e6;
+
+/**
+ * Return time % duration but always return a number instead of NaN when duration is 0.
+ *
+ * @param {number} time - The time.
+ * @param {number} duration - The duration.
+ * @returns {number} The time % duration.
+ */
+function capTime(time, duration) {
+    return (time % duration) || 0;
+}
+
+/**
+ * A SoundInstance plays a {@link Sound}.
+ *
+ * One instance is one playback. It wraps an `AudioBufferSourceNode`, available as {@link source}
+ * once playing, with a gain for {@link volume}, and carries {@link pitch}, {@link loop},
+ * {@link startTime} and {@link duration} to select the region of the sound it plays. {@link play},
+ * {@link pause}, {@link resume} and {@link stop} drive it and fire the events of the same names,
+ * with `end` fired when playback finishes on its own; {@link isPlaying}, {@link isPaused} and
+ * {@link isStopped} report the state, and {@link currentTime} can be read or set to seek.
+ * Instances are normally created by {@link SoundSlot#play} on a {@link SoundComponent}, which
+ * returns the instance so a script can adjust or stop that one playback. {@link setExternalNodes}
+ * inserts Web Audio nodes such as filters between the source and the destination.
+ *
+ * @example
+ * const instance = entity.sound.play('engine');
+ * instance.pitch = 1.5;
+ * instance.once('end', () => console.log('finished'));
+ * @category Sound
+ */
+class SoundInstance extends EventHandler {
+    /**
+     * Fired when the instance starts playing its source.
+     *
+     * @event
+     * @example
+     * instance.on('play', () => {
+     *     console.log('Instance started playing');
+     * });
+     */
+    static EVENT_PLAY = 'play';
+
+    /**
+     * Fired when the instance is paused.
+     *
+     * @event
+     * @example
+     * instance.on('pause', () => {
+     *     console.log('Instance paused');
+     * });
+     */
+    static EVENT_PAUSE = 'pause';
+
+    /**
+     * Fired when the instance is resumed.
+     *
+     * @event
+     * @example
+     * instance.on('resume', () => {
+     *     console.log('Instance resumed');
+     * });
+     */
+    static EVENT_RESUME = 'resume';
+
+    /**
+     * Fired when the instance is stopped.
+     *
+     * @event
+     * @example
+     * instance.on('stop', () => {
+     *     console.log('Instance stopped');
+     * });
+     */
+    static EVENT_STOP = 'stop';
+
+    /**
+     * Fired when the sound currently played by the instance ends.
+     *
+     * @event
+     * @example
+     * instance.on('end', () => {
+     *     console.log('Instance ended');
+     * });
+     */
+    static EVENT_END = 'end';
+
+    /**
+     * Gets the source that plays the sound resource. Source is only available after calling play.
+     *
+     * @type {AudioBufferSourceNode|null}
+     */
+    source = null;
+
+    /**
+     * Create a new SoundInstance instance.
+     *
+     * @param {SoundManager} manager - The sound manager.
+     * @param {Sound} sound - The sound to play.
+     * @param {object} options - Options for the instance.
+     * @param {number} [options.volume] - The playback volume, between 0 and 1. Defaults to 1.
+     * @param {number} [options.pitch] - The relative pitch. Defaults to 1 (plays at normal pitch).
+     * @param {boolean} [options.loop] - Whether the sound should loop when it reaches the end or
+     * not. Defaults to false.
+     * @param {number} [options.startTime] - The time from which the playback will start in
+     * seconds. Default is 0 to start at the beginning. Defaults to 0.
+     * @param {number} [options.duration] - The total time after the startTime in seconds when
+     * playback will stop or restart if loop is true. Defaults to 0.
+     * @param {Function} [options.onPlay] - Function called when the instance starts playing.
+     * @param {Function} [options.onPause] - Function called when the instance is paused.
+     * @param {Function} [options.onResume] - Function called when the instance is resumed.
+     * @param {Function} [options.onStop] - Function called when the instance is stopped.
+     * @param {Function} [options.onEnd] - Function called when the instance ends.
+     */
+    constructor(manager, sound, options) {
+        super();
+
+        /**
+         * @type {SoundManager}
+         * @private
+         */
+        this._manager = manager;
+
+        /**
+         * @type {number}
+         * @private
+         */
+        this._volume = options.volume !== undefined ? math.clamp(Number(options.volume) || 0, 0, 1) : 1;
+
+        /**
+         * @type {number}
+         * @private
+         */
+        this._pitch = options.pitch !== undefined ? Math.max(0.01, Number(options.pitch) || 0) : 1;
+
+        /** @private */
+        this._loop = !!(options.loop !== undefined ? options.loop : false);
+
+        /**
+         * @type {Sound}
+         * @private
+         */
+        this._sound = sound;
+
+        /**
+         * Start at 'stopped'.
+         *
+         * @type {number}
+         * @private
+         */
+        this._state = STATE_STOPPED;
+
+        /**
+         * True if the manager was suspended.
+         *
+         * @private
+         */
+        this._suspended = false;
+
+        /**
+         * Greater than 0 if we want to suspend the event handled to the 'onended' event.
+         * When an 'onended' event is suspended, this counter is decremented by 1.
+         * When a future 'onended' event is to be suspended, this counter is incremented by 1.
+         *
+         * @private
+         */
+        this._suspendEndEvent = 0;
+
+        /**
+         * True if we want to suspend firing instance events.
+         *
+         * @private
+         */
+        this._suspendInstanceEvents = false;
+
+        /**
+         * If true then the instance will start playing its source when its created.
+         *
+         * @private
+         */
+        this._playWhenLoaded = true;
+
+        /** @private */
+        this._startTime = Math.max(0, Number(options.startTime) || 0);
+
+        /** @private */
+        this._duration = Math.max(0, Number(options.duration) || 0);
+
+        /**
+         * @type {number|null}
+         * @private
+         */
+        this._startOffset = null;
+
+        // external event handlers
+        /** @private */
+        this._onPlayCallback = options.onPlay;
+        /** @private */
+        this._onPauseCallback = options.onPause;
+        /** @private */
+        this._onResumeCallback = options.onResume;
+        /** @private */
+        this._onStopCallback = options.onStop;
+        /** @private */
+        this._onEndCallback = options.onEnd;
+
+        /** @private */
+        this._startedAt = 0;
+
+        /**
+         * Manually keep track of the playback position because the Web Audio API does not
+         * provide a way to do this accurately if the playbackRate is not 1.
+         *
+         * @private
+         */
+        this._currentTime = 0;
+
+        /**
+         * The playback position relative to startTime when _startedAt was recorded.
+         *
+         * @private
+         */
+        this._currentOffset = 0;
+
+        /**
+         * The offset into the buffer, in seconds, that the source was playing at when the position
+         * tracking used by the loop region was last brought up to date.
+         *
+         * @private
+         */
+        this._sourceOffset = 0;
+
+        /**
+         * The context time that _sourceOffset was recorded at.
+         *
+         * @private
+         */
+        this._sourceOffsetAt = 0;
+
+        /**
+         * Whether the source has been looping since _sourceOffset was recorded.
+         *
+         * @private
+         */
+        this._sourceLooping = false;
+
+        /**
+         * Whether a stop at the end of the loop region is currently scheduled on the source.
+         *
+         * @private
+         */
+        this._regionStopPending = false;
+
+        /**
+         * The input node is the one that is connected to the source.
+         *
+         * @type {AudioNode|null}
+         * @private
+         */
+        this._inputNode = null;
+
+        /**
+         * The connected node is the one that is connected to the destination (speakers). Any
+         * external nodes will be connected to this node.
+         *
+         * @type {AudioNode|null}
+         * @private
+         */
+        this._connectorNode = null;
+
+        /**
+         * The first external node set by a user.
+         *
+         * @type {AudioNode|null}
+         * @private
+         */
+        this._firstNode = null;
+
+        /**
+         * The last external node set by a user.
+         *
+         * @type {AudioNode|null}
+         * @private
+         */
+        this._lastNode = null;
+
+        /**
+         * Set to true if a play() request was issued when the AudioContext was still suspended,
+         * and will therefore wait until it is resumed to play the audio.
+         *
+         * @private
+         */
+        this._waitingContextSuspension = false;
+
+        // Web Audio is unavailable - leave the instance inert. play()/setExternalNodes()/etc.
+        // will become no-ops.
+        if (!this._manager.context) {
+            return;
+        }
+
+        this._initializeNodes();
+
+        /** @private */
+        this._endedHandler = this._onEnded.bind(this);
+    }
+
+    /**
+     * Sets the current time of the sound that is playing, relative to {@link startTime}. If the
+     * value provided is bigger than the duration of the instance it will wrap from the beginning.
+     *
+     * @type {number}
+     */
+    set currentTime(value) {
+        value = Number(value) || 0;
+        if (value < 0) return;
+
+        const duration = this.duration;
+        const currentTime = duration ? capTime(value, duration) : value;
+
+        if (this._state === STATE_PLAYING) {
+            const suspend = this._suspendInstanceEvents;
+            this._suspendInstanceEvents = true;
+
+            // stop first which will set _startOffset to null
+            this.stop();
+
+            // set _startOffset and play
+            this._startOffset = currentTime;
+            this.play();
+            this._suspendInstanceEvents = suspend;
+        } else {
+            // set _startOffset which will be used when the instance will start playing
+            this._startOffset = currentTime;
+            // set _currentTime
+            this._currentTime = currentTime;
+        }
+    }
+
+    /**
+     * Gets the current time of the sound that is playing, relative to {@link startTime}.
+     *
+     * @type {number}
+     */
+    get currentTime() {
+        // if the user has set the currentTime and we have not used it yet
+        // then just return that
+        if (this._startOffset !== null) {
+            return this._startOffset;
+        }
+
+        // if the sound is paused return the currentTime calculated when
+        // pause() was called
+        if (this._state === STATE_PAUSED) {
+            return this._currentTime;
+        }
+
+        // if the sound is stopped or we don't have a source
+        // return 0
+        if (this._state === STATE_STOPPED || !this.source) {
+            return 0;
+        }
+
+        // recalculate current time
+        this._updateCurrentTime();
+        return this._currentTime;
+    }
+
+    /**
+     * Sets the duration of the sound that the instance will play starting from startTime.
+     *
+     * @type {number}
+     */
+    set duration(value) {
+        this._duration = Math.max(0, Number(value) || 0);
+
+        // restart
+        const isPlaying = this._state === STATE_PLAYING;
+        this.stop();
+        if (isPlaying) {
+            this.play();
+        }
+    }
+
+    /**
+     * Gets the duration of the sound that the instance will play starting from {@link startTime}.
+     * The returned value is clamped to the time available after the normalized start time.
+     *
+     * @type {number}
+     */
+    get duration() {
+        if (!this._sound) {
+            return 0;
+        }
+        if (this._duration) {
+            const soundDuration = this._sound.duration;
+            const startTime = capTime(this._startTime, soundDuration);
+            return Math.min(this._duration, soundDuration - startTime);
+        }
+        return this._sound.duration;
+    }
+
+    /**
+     * Gets whether the instance is currently paused.
+     *
+     * @type {boolean}
+     */
+    get isPaused() {
+        return this._state === STATE_PAUSED;
+    }
+
+    /**
+     * Gets whether the instance is currently playing.
+     *
+     * @type {boolean}
+     */
+    get isPlaying() {
+        return this._state === STATE_PLAYING;
+    }
+
+    /**
+     * Gets whether the instance is currently stopped.
+     *
+     * @type {boolean}
+     */
+    get isStopped() {
+        return this._state === STATE_STOPPED;
+    }
+
+    /**
+     * Gets whether the instance is currently suspended because the window is not focused.
+     *
+     * @type {boolean}
+     */
+    get isSuspended() {
+        return this._suspended;
+    }
+
+    /**
+     * Sets whether the instance will restart when it finishes playing.
+     *
+     * @type {boolean}
+     */
+    set loop(value) {
+        const loop = !!value;
+        const wasLooping = this._loop;
+        this._loop = loop;
+
+        if (this.source) {
+            this.source.loop = loop;
+
+            // the duration is not passed to the source for looping instances, so the end of the
+            // loop region has to be scheduled (and unscheduled) manually as looping is toggled
+            if (wasLooping !== loop && this._duration && this._state === STATE_PLAYING) {
+                this._updateRegionStop();
+            }
+        }
+    }
+
+    /**
+     * Gets whether the instance will restart when it finishes playing.
+     *
+     * @type {boolean}
+     */
+    get loop() {
+        return this._loop;
+    }
+
+    /**
+     * Sets the pitch modifier to play the sound with. Must be larger than 0.01.
+     *
+     * @type {number}
+     */
+    set pitch(pitch) {
+        // set offset to current time so that
+        // we calculate the rest of the time with the new pitch
+        // from now on
+        if (this._manager.context) {
+            this._currentOffset = this.currentTime;
+            this._startedAt = this._manager.context.currentTime;
+
+            // bring the tracked source position up to date while _pitch is still the old rate
+            if (this.source) {
+                this._syncSourcePosition();
+            }
+        }
+
+        this._pitch = Math.max(Number(pitch) || 0, 0.01);
+        if (this.source) {
+            this.source.playbackRate.value = this._pitch;
+
+            // a pending stop was scheduled in context time using the old rate
+            if (this._regionStopPending) {
+                this._updateRegionStop();
+            }
+        }
+    }
+
+    /**
+     * Gets the pitch modifier to play the sound with.
+     *
+     * @type {number}
+     */
+    get pitch() {
+        return this._pitch;
+    }
+
+    /**
+     * Sets the sound resource that the instance will play.
+     *
+     * @type {Sound}
+     */
+    set sound(value) {
+        this._sound = value;
+
+        if (this._state !== STATE_STOPPED) {
+            this.stop();
+        } else {
+            this._createSource();
+        }
+    }
+
+    /**
+     * Gets the sound resource that the instance will play.
+     *
+     * @type {Sound}
+     */
+    get sound() {
+        return this._sound;
+    }
+
+    /**
+     * Sets the start time from which the sound will start playing.
+     *
+     * @type {number}
+     */
+    set startTime(value) {
+        this._startTime = Math.max(0, Number(value) || 0);
+
+        // restart
+        const isPlaying = this._state === STATE_PLAYING;
+        this.stop();
+        if (isPlaying) {
+            this.play();
+        }
+    }
+
+    /**
+     * Gets the start time from which the sound will start playing.
+     *
+     * @type {number}
+     */
+    get startTime() {
+        return this._startTime;
+    }
+
+    /**
+     * Sets the volume modifier to play the sound with. In range 0-1.
+     *
+     * @type {number}
+     */
+    set volume(volume) {
+        volume = math.clamp(volume, 0, 1);
+        this._volume = volume;
+        if (this.gain) {
+            this.gain.gain.value = volume * this._manager.volume;
+        }
+    }
+
+    /**
+     * Gets the volume modifier to play the sound with. In range 0-1.
+     *
+     * @type {number}
+     */
+    get volume() {
+        return this._volume;
+    }
+
+    /** @private */
+    _onPlay() {
+        this.fire('play');
+
+        if (this._onPlayCallback) {
+            this._onPlayCallback(this);
+        }
+    }
+
+    /** @private */
+    _onPause() {
+        this.fire('pause');
+
+        if (this._onPauseCallback) {
+            this._onPauseCallback(this);
+        }
+    }
+
+    /** @private */
+    _onResume() {
+        this.fire('resume');
+
+        if (this._onResumeCallback) {
+            this._onResumeCallback(this);
+        }
+    }
+
+    /** @private */
+    _onStop() {
+        this.fire('stop');
+
+        if (this._onStopCallback) {
+            this._onStopCallback(this);
+        }
+    }
+
+    /** @private */
+    _onEnded() {
+        // the callback is not fired synchronously
+        // so only decrement _suspendEndEvent when the
+        // callback is fired
+        if (this._suspendEndEvent > 0) {
+            this._suspendEndEvent--;
+            return;
+        }
+
+        this.fire('end');
+
+        if (this._onEndCallback) {
+            this._onEndCallback(this);
+        }
+
+        this.stop();
+    }
+
+    /**
+     * Handle the manager's 'volumechange' event.
+     *
+     * @private
+     */
+    _onManagerVolumeChange() {
+        this.volume = this._volume;
+    }
+
+    /**
+     * Handle the manager's 'suspend' event.
+     *
+     * @private
+     */
+    _onManagerSuspend() {
+        if (this._state === STATE_PLAYING && !this._suspended) {
+            this._suspended = true;
+            this.pause();
+        }
+    }
+
+    /**
+     * Handle the manager's 'resume' event.
+     *
+     * @private
+     */
+    _onManagerResume() {
+        if (this._suspended) {
+            this._suspended = false;
+            this.resume();
+        }
+    }
+
+    /**
+     * Creates internal audio nodes and connects them.
+     *
+     * @private
+     */
+    _initializeNodes() {
+        // create gain node for volume control
+        this.gain = this._manager.context.createGain();
+        this._inputNode = this.gain;
+        // the gain node is also the connector node for 2D sound instances
+        this._connectorNode = this.gain;
+        this._connectorNode.connect(this._manager.context.destination);
+    }
+
+    /**
+     * Attempt to begin playback the sound.
+     * If the AudioContext is suspended, the audio will only start once it's resumed.
+     * If the sound is already playing, this will restart the sound.
+     *
+     * @returns {boolean} True if the sound was started immediately.
+     */
+    play() {
+        // No audio context - the instance is inert.
+        if (!this._manager.context) {
+            return false;
+        }
+
+        if (this._state !== STATE_STOPPED) {
+            this.stop();
+        }
+        // set state to playing
+        this._state = STATE_PLAYING;
+        // no need for this anymore
+        this._playWhenLoaded = false;
+
+        // play() was already issued but hasn't actually started yet
+        if (this._waitingContextSuspension) {
+            return false;
+        }
+
+        // manager is suspended so audio cannot start now - wait for manager to resume
+        if (this._manager.suspended) {
+            this._manager.once('resume', this._playAudioImmediate, this);
+            this._waitingContextSuspension = true;
+
+            return false;
+        }
+
+        this._playAudioImmediate();
+
+        return true;
+    }
+
+    /**
+     * Immediately play the sound.
+     * This method assumes the AudioContext is ready (not suspended or locked).
+     *
+     * @private
+     */
+    _playAudioImmediate() {
+        this._waitingContextSuspension = false;
+
+        // between play() and the manager being ready to play, a stop() or pause() call was made
+        if (this._state !== STATE_PLAYING) {
+            return;
+        }
+
+        if (!this.source) {
+            this._createSource();
+        }
+
+        // calculate the current offset relative to startTime and its matching buffer offset
+        const currentOffset = capTime(this._startOffset, this.duration);
+        const offset = capTime(this._startTime + currentOffset, this._sound.duration);
+        // reset start offset now that we started the sound
+        this._startOffset = null;
+
+        // start source with specified offset
+        this._startSource(offset, currentOffset);
+
+        // reset times
+        this._startedAt = this._manager.context.currentTime;
+        this._currentTime = 0;
+        this._currentOffset = currentOffset;
+
+        // Initialize volume and loop - note moved to be after start() because of Chrome bug
+        this.volume = this._volume;
+        this.loop = this._loop;
+        this.pitch = this._pitch;
+
+        // handle suspend events / volumechange events
+        this._manager.on('volumechange', this._onManagerVolumeChange, this);
+        this._manager.on('suspend', this._onManagerSuspend, this);
+        this._manager.on('resume', this._onManagerResume, this);
+        this._manager.on('destroy', this._onManagerDestroy, this);
+
+        if (!this._suspendInstanceEvents) {
+            this._onPlay();
+        }
+    }
+
+    /**
+     * Starts the source at the specified offset into the buffer.
+     *
+     * The duration is only passed to the source for non-looping instances. For a looping instance,
+     * the region to play is defined by loopStart/loopEnd - passing a duration as well would stop
+     * playback at the end of the first iteration instead of looping.
+     *
+     * @param {number} offset - The offset into the buffer, in seconds, to start playing from.
+     * @param {number} currentOffset - The offset relative to startTime, in seconds.
+     * @private
+     */
+    _startSource(offset, currentOffset) {
+        if (this._duration && !this._loop) {
+            this.source.start(0, offset, this.duration - currentOffset);
+        } else {
+            this.source.start(0, offset);
+        }
+
+        this._sourceOffset = offset;
+        this._sourceOffsetAt = this._manager.context.currentTime;
+        this._sourceLooping = this._loop;
+        this._regionStopPending = false;
+    }
+
+    /**
+     * Brings the tracked source position up to date and returns the offset into the buffer, in
+     * seconds, that the source is currently playing at. Tracked separately from _currentTime
+     * because that is capped to the duration of the instance rather than the buffer.
+     *
+     * @returns {number} The offset into the buffer, in seconds.
+     * @private
+     */
+    _syncSourcePosition() {
+        const source = this.source;
+        const context = this._manager.context;
+
+        let position = this._sourceOffset + (context.currentTime - this._sourceOffsetAt) * this._pitch;
+
+        // a source that has been looping has wrapped around the loop region
+        const region = source.loopEnd - source.loopStart;
+        if (this._sourceLooping && region > 0 && position > source.loopEnd) {
+            position = source.loopStart + ((position - source.loopStart) % region);
+        }
+
+        this._sourceOffset = position;
+        this._sourceOffsetAt = context.currentTime;
+        this._sourceLooping = source.loop;
+
+        return position;
+    }
+
+    /**
+     * Schedules, reschedules or unschedules the stop that ends the loop region. A looping source is
+     * started without a duration, so when looping is disabled the end of the current iteration has
+     * to be scheduled manually - and that deadline is in context time, so it has to be revisited
+     * whenever looping or the pitch changes.
+     *
+     * @private
+     */
+    _updateRegionStop() {
+        const source = this.source;
+        const context = this._manager.context;
+        const position = this._syncSourcePosition();
+
+        if (this._loop) {
+            if (this._regionStopPending) {
+                source.stop(context.currentTime + STOP_NEVER_DELAY);
+                this._regionStopPending = false;
+            }
+            return;
+        }
+
+        const region = source.loopEnd - source.loopStart;
+        if (region <= 0) {
+            return;
+        }
+
+        source.stop(context.currentTime + Math.max(0, source.loopEnd - position) / this._pitch);
+        this._regionStopPending = true;
+    }
+
+    /**
+     * Pauses playback of sound. Call resume() to resume playback from the same position.
+     *
+     * @returns {boolean} Returns true if the sound was paused.
+     */
+    pause() {
+        // no need for this anymore
+        this._playWhenLoaded = false;
+
+        if (this._state !== STATE_PLAYING) {
+            return false;
+        }
+
+        // set state to paused
+        this._state = STATE_PAUSED;
+
+        // play() was issued but hasn't actually started yet.
+        if (this._waitingContextSuspension) {
+            return true;
+        }
+
+        // store current time
+        this._updateCurrentTime();
+
+        // Stop the source and re-create it because we cannot reuse the same source.
+        // Suspend the end event as we are manually stopping the source
+        this._suspendEndEvent++;
+        this.source.stop(0);
+        this.source = null;
+
+        // reset user-set start offset
+        this._startOffset = null;
+
+        if (!this._suspendInstanceEvents) {
+            this._onPause();
+        }
+
+        return true;
+    }
+
+    /**
+     * Resumes playback of the sound. Playback resumes at the point that the audio was paused.
+     *
+     * @returns {boolean} Returns true if the sound was resumed.
+     */
+    resume() {
+        if (this._state !== STATE_PAUSED) {
+            return false;
+        }
+
+        // start at the point relative to startTime where the sound was paused
+        let currentOffset = this.currentTime;
+
+        // set state back to playing
+        this._state = STATE_PLAYING;
+
+        // play() was issued but hasn't actually started yet
+        if (this._waitingContextSuspension) {
+            return true;
+        }
+
+        if (!this.source) {
+            this._createSource();
+        }
+
+        // if the user set the 'currentTime' property while the sound
+        // was paused then use that as the offset instead
+        if (this._startOffset !== null) {
+            currentOffset = capTime(this._startOffset, this.duration);
+
+            // reset offset
+            this._startOffset = null;
+        }
+
+        const offset = capTime(this._startTime + currentOffset, this._sound.duration);
+
+        // start source
+        this._startSource(offset, currentOffset);
+
+        this._startedAt = this._manager.context.currentTime;
+        this._currentOffset = currentOffset;
+
+        // Initialize parameters
+        this.volume = this._volume;
+        this.loop = this._loop;
+        this.pitch = this._pitch;
+        this._playWhenLoaded = false;
+
+        if (!this._suspendInstanceEvents) {
+            this._onResume();
+        }
+
+        return true;
+    }
+
+    /**
+     * Stops playback of sound. Calling play() again will restart playback from the beginning of
+     * the sound.
+     *
+     * @returns {boolean} Returns true if the sound was stopped.
+     */
+    stop() {
+        this._playWhenLoaded = false;
+
+        if (this._state === STATE_STOPPED) {
+            return false;
+        }
+
+        // set state to stopped
+        const wasPlaying = this._state === STATE_PLAYING;
+        this._state = STATE_STOPPED;
+
+        // play() was issued but hasn't actually started yet
+        if (this._waitingContextSuspension) {
+            return true;
+        }
+
+        // unsubscribe from manager events
+        this._manager.off('volumechange', this._onManagerVolumeChange, this);
+        this._manager.off('suspend', this._onManagerSuspend, this);
+        this._manager.off('resume', this._onManagerResume, this);
+        this._manager.off('destroy', this._onManagerDestroy, this);
+
+        // reset stored times
+        this._startedAt = 0;
+        this._currentTime = 0;
+        this._currentOffset = 0;
+
+        this._startOffset = null;
+
+        this._suspendEndEvent++;
+        if (wasPlaying && this.source) {
+            this.source.stop(0);
+        }
+        this.source = null;
+
+        if (!this._suspendInstanceEvents) {
+            this._onStop();
+        }
+
+        return true;
+    }
+
+    /**
+     * Connects external Web Audio API nodes. You need to pass the first node of the node graph
+     * that you created externally and the last node of that graph. The first node will be
+     * connected to the audio source and the last node will be connected to the destination of the
+     * AudioContext (e.g. speakers). Requires Web Audio API support.
+     *
+     * @param {AudioNode} firstNode - The first node that will be connected to the audio source of sound instances.
+     * @param {AudioNode} [lastNode] - The last node that will be connected to the destination of the AudioContext.
+     * If unspecified then the firstNode will be connected to the destination instead.
+     * @example
+     * const context = app.systems.sound.context;
+     * const analyzer = context.createAnalyzer();
+     * const distortion = context.createWaveShaper();
+     * const filter = context.createBiquadFilter();
+     * analyzer.connect(distortion);
+     * distortion.connect(filter);
+     * instance.setExternalNodes(analyzer, filter);
+     */
+    setExternalNodes(firstNode, lastNode) {
+        if (!firstNode) {
+            console.error('The firstNode must be a valid Audio Node');
+            return;
+        }
+
+        // inert instance - no Web Audio graph to wire into
+        if (!this._connectorNode) {
+            return;
+        }
+
+        if (!lastNode) {
+            lastNode = firstNode;
+        }
+
+        // connections are:
+        // source -> inputNode -> connectorNode -> [firstNode -> ... -> lastNode] -> speakers
+
+        const speakers = this._manager.context.destination;
+
+        if (this._firstNode !== firstNode) {
+            if (this._firstNode) {
+                // if firstNode already exists means the connector node
+                // is connected to it so disconnect it
+                this._connectorNode.disconnect(this._firstNode);
+            } else {
+                // if firstNode does not exist means that its connected
+                // to the speakers so disconnect it
+                this._connectorNode.disconnect(speakers);
+            }
+
+            // set first node and connect with connector node
+            this._firstNode = firstNode;
+            this._connectorNode.connect(firstNode);
+        }
+
+        if (this._lastNode !== lastNode) {
+            if (this._lastNode) {
+                // if last node exists means it's connected to the speakers so disconnect it
+                this._lastNode.disconnect(speakers);
+            }
+
+            // set last node and connect with speakers
+            this._lastNode = lastNode;
+            this._lastNode.connect(speakers);
+        }
+    }
+
+    /**
+     * Clears any external nodes set by {@link setExternalNodes}.
+     */
+    clearExternalNodes() {
+        // inert instance - nothing to disconnect
+        if (!this._connectorNode) {
+            return;
+        }
+
+        const speakers = this._manager.context.destination;
+
+        // break existing connections
+        if (this._firstNode) {
+            this._connectorNode.disconnect(this._firstNode);
+            this._firstNode = null;
+        }
+
+        if (this._lastNode) {
+            this._lastNode.disconnect(speakers);
+            this._lastNode = null;
+        }
+
+        // reset connect to speakers
+        this._connectorNode.connect(speakers);
+    }
+
+    /**
+     * Gets any external nodes set by {@link setExternalNodes}.
+     *
+     * @returns {AudioNode[]} Returns an array that contains the two nodes set by
+     * {@link setExternalNodes}.
+     */
+    getExternalNodes() {
+        return [this._firstNode, this._lastNode];
+    }
+
+    /**
+     * Creates the source for the instance.
+     *
+     * @returns {AudioBufferSourceNode|null} Returns the created source or null if the sound
+     * instance has no {@link Sound} associated with it.
+     * @private
+     */
+    _createSource() {
+        if (!this._sound) {
+            return null;
+        }
+
+        const context = this._manager.context;
+
+        // inert instance - no audio context available
+        if (!context) {
+            return null;
+        }
+
+        if (this._sound.buffer) {
+            this.source = context.createBufferSource();
+            this.source.buffer = this._sound.buffer;
+
+            // Connect up the nodes
+            this.source.connect(this._inputNode);
+
+            // set events
+            this.source.onended = this._endedHandler;
+
+            // set loopStart and loopEnd so that the source starts and ends at the correct user-set times
+            this.source.loopStart = capTime(this._startTime, this.source.buffer.duration);
+            if (this._duration) {
+                // clamp instead of wrapping - a wrapped loopEnd can collapse onto loopStart, which
+                // the Web Audio API interprets as 'loop the whole buffer'
+                this.source.loopEnd = Math.min(this.source.loopStart + this._duration, this.source.buffer.duration);
+            }
+        }
+
+        return this.source;
+    }
+
+    /**
+     * Sets the current time taking into account the time the instance started playing, the current
+     * pitch and the current time offset.
+     *
+     * @private
+     */
+    _updateCurrentTime() {
+        this._currentTime = capTime((this._manager.context.currentTime - this._startedAt) * this._pitch + this._currentOffset, this.duration);
+    }
+
+    /**
+     * Handle the manager's 'destroy' event.
+     *
+     * @private
+     */
+    _onManagerDestroy() {
+        if (this.source && this._state === STATE_PLAYING) {
+            this.source.stop(0);
+            this.source = null;
+        }
+    }
+}
+
+export { SoundInstance };

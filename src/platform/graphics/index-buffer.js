@@ -1,0 +1,281 @@
+import { Debug } from '../../core/debug.js';
+import { TRACEID_VRAM_IB } from '../../core/constants.js';
+import { BufferUtils } from './buffer-utils.js';
+
+/**
+ * @import { GraphicsDevice } from './graphics-device.js'
+ */
+
+import {
+    BUFFER_STATIC, typedArrayIndexFormats, typedArrayIndexFormatsByteSize
+} from './constants.js';
+
+let id = 0;
+
+/**
+ * An index buffer stores index values into a {@link VertexBuffer}. Indexed graphical primitives
+ * can normally utilize less memory that unindexed primitives (if vertices are shared).
+ *
+ * Typically, index buffers are set on {@link Mesh} objects.
+ *
+ * @category Graphics
+ */
+class IndexBuffer {
+    /**
+     * Create a new IndexBuffer instance.
+     *
+     * @param {GraphicsDevice} graphicsDevice - The graphics device used to manage this index buffer.
+     * @param {number} format - The type of each index to be stored in the index buffer. Can be:
+     *
+     * - {@link INDEXFORMAT_UINT8}
+     * - {@link INDEXFORMAT_UINT16}
+     * - {@link INDEXFORMAT_UINT32}
+     * @param {number} numIndices - The number of indices to be stored in the index buffer.
+     * @param {number} [usage] - The usage type of the vertex buffer. Can be:
+     *
+     * - {@link BUFFER_DYNAMIC}
+     * - {@link BUFFER_STATIC}
+     * - {@link BUFFER_STREAM}
+     *
+     * Defaults to {@link BUFFER_STATIC}.
+     * @param {ArrayBuffer|ArrayBufferView} [initialData] - Initial data. Can be an
+     * {@link ArrayBuffer} or a typed array (for example a {@link Uint16Array}). The data is stored
+     * by reference and is not copied, so a typed array that is a view into a larger buffer is kept
+     * as-is. If left unspecified, the index buffer will be initialized to zeros.
+     * @param {object} [options] - Object for passing optional arguments.
+     * @param {boolean} [options.storage] - Defines if the index buffer can be used as a storage
+     * buffer by a compute shader. Defaults to false. Only supported on WebGPU.
+     * @example
+     * // Create an index buffer holding 3 16-bit indices. The buffer is marked as
+     * // static, hinting that the buffer will never be modified.
+     * const indices = new Uint16Array([0, 1, 2]);
+     * const indexBuffer = new IndexBuffer(graphicsDevice,
+     *                                        INDEXFORMAT_UINT16,
+     *                                        3,
+     *                                        BUFFER_STATIC,
+     *                                        indices);
+     */
+    constructor(graphicsDevice, format, numIndices, usage = BUFFER_STATIC, initialData, options) {
+        // By default, index buffers are static (better for performance since buffer data can be cached in VRAM)
+        this.device = graphicsDevice;
+        this.format = format;
+        this.numIndices = numIndices;
+        this.usage = usage;
+
+        this.id = id++;
+
+        this.impl = graphicsDevice.createIndexBufferImpl(this, options);
+
+        // Allocate the storage
+        const bytesPerIndex = typedArrayIndexFormatsByteSize[format];
+        this.bytesPerIndex = bytesPerIndex;
+        this.numBytes = this.numIndices * bytesPerIndex;
+
+        if (initialData) {
+            this.setData(initialData);
+        } else {
+            this.storage = new ArrayBuffer(this.numBytes);
+        }
+
+        this.adjustVramSizeTracking(graphicsDevice._vram, this.numBytes);
+
+        this.device.buffers.add(this);
+    }
+
+    /**
+     * Frees resources associated with this index buffer.
+     */
+    destroy() {
+
+        // stop tracking the index buffer
+        const device = this.device;
+        device.buffers.delete(this);
+
+        if (this.device.indexBuffer === this) {
+            this.device.indexBuffer = null;
+        }
+
+        if (this.impl.initialized) {
+            this.impl.destroy(device);
+            this.adjustVramSizeTracking(device._vram, -this.storage.byteLength);
+        }
+    }
+
+    adjustVramSizeTracking(vram, size) {
+        Debug.trace(TRACEID_VRAM_IB, `${this.id} size: ${size} vram.ib: ${vram.ib} => ${vram.ib + size}`);
+        vram.ib += size;
+    }
+
+    /**
+     * Called when the rendering context was lost. It releases all context related resources.
+     *
+     * @ignore
+     */
+    loseContext() {
+        this.impl.loseContext();
+    }
+
+    /**
+     * Called when the rendering context is restored. Recreates the GPU buffer and uploads from
+     * {@link IndexBuffer#lock|lock} storage.
+     *
+     * @ignore
+     */
+    restoreContext() {
+        this.unlock();
+    }
+
+    /**
+     * Returns the data format of the specified index buffer.
+     *
+     * @returns {number} The data format of the specified index buffer. Can be:
+     *
+     * - {@link INDEXFORMAT_UINT8}
+     * - {@link INDEXFORMAT_UINT16}
+     * - {@link INDEXFORMAT_UINT32}
+     */
+    getFormat() {
+        return this.format;
+    }
+
+    /**
+     * Returns the number of indices stored in the specified index buffer.
+     *
+     * @returns {number} The number of indices stored in the specified index buffer.
+     */
+    getNumIndices() {
+        return this.numIndices;
+    }
+
+    /**
+     * Gives access to the block of memory that stores the buffer's indices.
+     *
+     * @returns {ArrayBuffer|ArrayBufferView} The memory that stores the buffer's indices. This
+     * matches whatever was supplied as the initial data: an {@link ArrayBuffer} when none was
+     * provided, otherwise the {@link ArrayBuffer} or typed array that was passed in. Use
+     * {@link ArrayBuffer.isView} to distinguish the two before accessing it.
+     */
+    lock() {
+        return this.storage;
+    }
+
+    /**
+     * Uploads the client side copy of the index buffer to the GPU. When called without arguments,
+     * uploads the entire buffer. An explicit range uploads only those bytes at the same GPU offset.
+     * The first upload always initializes the entire GPU buffer, regardless of the requested range.
+     * A zero byte length does nothing, including before the first upload.
+     *
+     * Partial uploads do not resize the buffer or change its CPU storage. The caller must upload
+     * every modified range before expecting those changes on the GPU. Context restoration uploads
+     * the entire CPU storage. Invalid ranges are ignored in all builds and report an assertion
+     * in debug builds.
+     *
+     * @param {number} [byteOffset] - Offset in bytes from the start of the buffer's storage.
+     * Defaults to 0. Must be a non-negative integer and a multiple of 4 on all graphics backends.
+     * @param {number} [byteLength] - Number of bytes to upload. Defaults to the remaining bytes
+     * after byteOffset. The length must be a non-negative integer and the range must fit within
+     * the buffer. Partial ranges require a length that is a multiple of 4. Full-buffer uploads
+     * support any byte length, whether the range is explicit or the arguments are omitted.
+     * @example
+     * // After modifying bytes 16 through 31 of the CPU storage:
+     * indexBuffer.unlock(16, 16);
+     */
+    unlock(byteOffset, byteLength) {
+        if (byteOffset !== undefined || byteLength !== undefined) {
+            byteOffset ??= 0;
+            byteLength ??= this.numBytes - byteOffset;
+
+            const fullRange = byteOffset === 0 && byteLength === this.numBytes;
+            const valid = Number.isInteger(byteOffset) && byteOffset >= 0 && byteOffset % 4 === 0 &&
+                Number.isInteger(byteLength) && byteLength >= 0 && (fullRange || byteLength % 4 === 0) &&
+                byteOffset + byteLength <= this.numBytes;
+            Debug.assert(valid, 'Buffer upload range must contain non-negative integers and fit within the buffer; partial ranges must be aligned to 4 bytes');
+
+            if (!valid || byteLength === 0) {
+                return;
+            }
+        }
+
+        this.impl.unlock(this, byteOffset, byteLength);
+    }
+
+    /**
+     * Set preallocated data on the index buffer.
+     *
+     * @param {ArrayBuffer|ArrayBufferView} data - The index data to set. Can be an
+     * {@link ArrayBuffer} or a typed array. Stored by reference, not copied.
+     * @returns {boolean} True if the data was set successfully, false otherwise.
+     * @ignore
+     */
+    setData(data) {
+        if (data.byteLength !== this.numBytes) {
+            Debug.error(`IndexBuffer: wrong initial data size: expected ${this.numBytes}, got ${data.byteLength}`);
+            return false;
+        }
+
+        this.storage = data;
+        this.unlock();
+        return true;
+    }
+
+    /**
+     * Copies the specified number of elements from data into index buffer. Optimized for
+     * performance from both typed array as well as array.
+     *
+     * @param {Uint8Array|Uint16Array|Uint32Array|number[]} data - The data to write.
+     * @param {number} count - The number of indices to write.
+     * @ignore
+     */
+    writeData(data, count) {
+        const indices = BufferUtils.createStorageView(this, typedArrayIndexFormats[this.format]);
+
+        // if data contains more indices than needed, copy from its subarray
+        if (data.length > count) {
+
+            // if data is typed array
+            if (ArrayBuffer.isView(data)) {
+                data = data.subarray(0, count);
+                indices.set(data);
+            } else {
+                // data is array, copy right amount manually
+                for (let i = 0; i < count; i++) {
+                    indices[i] = data[i];
+                }
+            }
+        } else {
+            // copy whole data
+            indices.set(data);
+        }
+
+        this.unlock();
+    }
+
+    /**
+     * Copies index data from index buffer into provided data array.
+     *
+     * @param {Uint8Array|Uint16Array|Uint32Array|number[]} data - The data array to write to.
+     * @returns {number} The number of indices read.
+     * @ignore
+     */
+    readData(data) {
+        // note: there is no need to unlock this buffer, as we are only reading from it
+        const indices = BufferUtils.createStorageView(this, typedArrayIndexFormats[this.format]);
+        const count = this.numIndices;
+
+        if (ArrayBuffer.isView(data)) {
+            // destination data is typed array, copy as much of the data as it can hold
+            Debug.assert(data.length >= count, 'Destination array is too small to receive all index data.');
+            data.set(data.length >= count ? indices : indices.subarray(0, data.length));
+        } else {
+            // data is array, copy right amount manually
+            data.length = 0;
+            for (let i = 0; i < count; i++) {
+                data[i] = indices[i];
+            }
+        }
+
+        return count;
+    }
+}
+
+export { IndexBuffer };
